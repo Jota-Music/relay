@@ -10,7 +10,10 @@ import (
 	"github.com/coder/websocket"
 )
 
-const maxCodeLen = 64
+const (
+	maxCodeLen      = 64
+	maxMessageBytes = 16 << 20
+)
 
 func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	code := strings.TrimSpace(r.URL.Query().Get("room"))
@@ -30,6 +33,7 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	conn.SetReadLimit(maxMessageBytes)
 
 	c := &client{conn: conn, role: role}
 	rm, assigned, err := h.join(code, role, c)

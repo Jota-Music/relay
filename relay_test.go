@@ -31,6 +31,7 @@ func dial(t *testing.T, base, room, role string) *websocket.Conn {
 	if err != nil {
 		t.Fatalf("dial %s: %v", role, err)
 	}
+	c.SetReadLimit(maxMessageBytes)
 	return c
 }
 
@@ -123,5 +124,21 @@ func TestAutoRole(t *testing.T) {
 	}
 	if m := read(t, guest); m["t"] != "members" || m["count"].(float64) != 2 {
 		t.Fatalf("guest members = %v", m)
+	}
+}
+
+func TestLargeMessageRelayed(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "big", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "big", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	big := `{"t":"queue","data":"` + strings.Repeat("a", 100_000) + `"}`
+	send(t, host, big)
+	if m := read(t, guest); m["t"] != "queue" {
+		t.Fatalf("relayed = %v", m)
 	}
 }
