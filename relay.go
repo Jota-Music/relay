@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -15,11 +18,17 @@ const (
 )
 
 type room struct {
-	code   string
-	host   *client
-	guests map[*client]struct{}
-	cache  map[string]json.RawMessage
-	timer  *time.Timer
+	code     string
+	host     *client
+	guests   map[*client]struct{}
+	cache    map[string]json.RawMessage
+	timer    *time.Timer
+	passHash string
+}
+
+func hashPass(p string) string {
+	sum := sha256.Sum256([]byte(p))
+	return hex.EncodeToString(sum[:])
 }
 
 func newRoom(code string) *room {
@@ -66,14 +75,23 @@ func newHub(maxGuests int, ttl time.Duration) *hub {
 
 // join adds c to a room. An empty role means "auto": c becomes host when the
 // room has none, otherwise a guest. It returns the role c was granted.
-func (h *hub) join(code, role string, c *client) (*room, string, error) {
+// pass is the optional room password: the first member sets it, the rest must
+// match it (only when it was set).
+func (h *hub) join(code, role, pass string, c *client) (*room, string, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	r := h.rooms[code]
 	if r == nil {
 		r = newRoom(code)
+		if pass != "" {
+			r.passHash = hashPass(pass)
+		}
 		h.rooms[code] = r
+	} else if r.passHash != "" {
+		if subtle.ConstantTimeCompare([]byte(hashPass(pass)), []byte(r.passHash)) != 1 {
+			return nil, "", errors.New("invalid room password")
+		}
 	}
 
 	if role == "" {

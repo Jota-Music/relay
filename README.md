@@ -29,6 +29,12 @@ When `AUTH_TOKEN` is set, clients must send it as `Authorization: Bearer <token>
 upgrade. `/healthz` stays open. The Jota app exposes a "Token" field and embeds it in
 the shared invite, so guests never type it.
 
+Rooms can additionally be protected with an optional **password**. The first member to
+join sets it; later joins must present the same value via `X-Room-Password` (or
+`?pass=`) or they get an `error` and the connection closes. An empty password leaves
+the room open. The app keeps the room password out of the invite so the code alone is
+not enough.
+
 Put it behind TLS (Caddy/nginx) so clients can use `wss://`. The app accepts either
 `wss://relay.example.com` or `https://relay.example.com` (the `/ws` path is added
 automatically), and `ws://`/`http://` for local testing.

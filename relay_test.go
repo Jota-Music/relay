@@ -35,6 +35,22 @@ func dial(t *testing.T, base, room, role string) *websocket.Conn {
 	return c
 }
 
+func dialPass(t *testing.T, base, room, role, pass string) (*websocket.Conn, *http.Response, error) {
+	t.Helper()
+	url := "ws" + strings.TrimPrefix(base, "http") + "/ws?room=" + room + "&role=" + role
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	header := http.Header{}
+	if pass != "" {
+		header.Set("X-Room-Password", pass)
+	}
+	c, resp, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPHeader: header})
+	if c != nil {
+		c.SetReadLimit(maxMessageBytes)
+	}
+	return c, resp, err
+}
+
 func read(t *testing.T, c *websocket.Conn) map[string]any {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -153,6 +169,33 @@ func TestAuthToken(t *testing.T) {
 		t.Fatalf("dial with token: %v", err)
 	}
 	conn.Close(websocket.StatusNormalClosure, "")
+}
+
+func TestRoomPassword(t *testing.T) {
+	srv := newTestServer(t)
+
+	host, _, err := dialPass(t, srv.URL, "locked", roleHost, "pw")
+	if err != nil {
+		t.Fatalf("host dial: %v", err)
+	}
+	read(t, host)
+
+	bad, _, err := dialPass(t, srv.URL, "locked", roleGuest, "")
+	if err != nil {
+		t.Fatalf("guest dial: %v", err)
+	}
+	if m := read(t, bad); m["t"] != "error" ||
+		!strings.Contains(m["reason"].(string), "password") {
+		t.Fatalf("expected password error, got %v", m)
+	}
+
+	good, _, err := dialPass(t, srv.URL, "locked", roleGuest, "pw")
+	if err != nil {
+		t.Fatalf("guest dial: %v", err)
+	}
+	if m := read(t, good); m["t"] != "members" || m["count"].(float64) != 2 {
+		t.Fatalf("guest members = %v", m)
+	}
 }
 
 func TestLargeMessageRelayed(t *testing.T) {

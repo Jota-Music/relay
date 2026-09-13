@@ -46,6 +46,10 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	code := strings.TrimSpace(r.URL.Query().Get("room"))
 	role := r.URL.Query().Get("role")
+	pass := r.Header.Get("X-Room-Password")
+	if pass == "" {
+		pass = r.URL.Query().Get("pass")
+	}
 	if !validCode(code) {
 		http.Error(w, "invalid room", http.StatusBadRequest)
 		return
@@ -64,7 +68,7 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(maxMessageBytes)
 
 	c := &client{conn: conn, role: role}
-	rm, assigned, err := h.join(code, role, c)
+	rm, assigned, err := h.join(code, role, pass, c)
 	if err != nil {
 		msg, _ := json.Marshal(map[string]any{"t": "error", "reason": err.Error()})
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
