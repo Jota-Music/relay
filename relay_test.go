@@ -105,3 +105,23 @@ func TestHostBusy(t *testing.T) {
 		t.Fatalf("busy host = %v", m)
 	}
 }
+
+func TestAutoRole(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "auto", "")
+	if m := read(t, host); m["t"] != "role" || m["role"] != "host" {
+		t.Fatalf("first role = %v", m)
+	}
+	if m := read(t, host); m["t"] != "members" || m["count"].(float64) != 1 {
+		t.Fatalf("host members = %v", m)
+	}
+
+	guest := dial(t, srv.URL, "auto", "")
+	if m := read(t, guest); m["t"] != "role" || m["role"] != "guest" {
+		t.Fatalf("second role = %v", m)
+	}
+	if m := read(t, guest); m["t"] != "members" || m["count"].(float64) != 2 {
+		t.Fatalf("guest members = %v", m)
+	}
+}

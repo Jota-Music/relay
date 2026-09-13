@@ -19,7 +19,7 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid room", http.StatusBadRequest)
 		return
 	}
-	if role != roleHost && role != roleGuest {
+	if role != "" && role != roleHost && role != roleGuest {
 		http.Error(w, "invalid role", http.StatusBadRequest)
 		return
 	}
@@ -32,7 +32,7 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c := &client{conn: conn, role: role}
-	rm, err := h.join(code, role, c)
+	rm, assigned, err := h.join(code, role, c)
 	if err != nil {
 		msg, _ := json.Marshal(map[string]any{"t": "error", "reason": err.Error()})
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -42,6 +42,10 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if role == "" {
+		msg, _ := json.Marshal(map[string]any{"t": "role", "role": assigned})
+		_ = c.send(msg)
+	}
 	h.sendMembers(rm)
 	h.replay(rm, c)
 	h.readLoop(c, rm)

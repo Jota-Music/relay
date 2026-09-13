@@ -31,7 +31,9 @@ automatically), and `ws://`/`http://` for local testing.
 
 Connect to `/ws?room=CODE&role=host|guest`. `CODE` is a shared secret (1–64 chars,
 `[A-Za-z0-9_-]`). The first `host` claims the room; a second one is rejected with an
-`error`. Guests are capped by `MAX_GUESTS`.
+`error`. Guests are capped by `MAX_GUESTS`. Omit `role` (or send it empty) to let the
+relay decide: it grants `host` when the room has none and `guest` otherwise, then sends
+the assigned role back as a `role` message.
 
 Messages are JSON text frames with a `t` field. The relay is a pipe: it forwards every
 frame to the other room members and understands only these control types.
@@ -50,6 +52,7 @@ Relay → client:
 | Message | Description |
 |---------|-------------|
 | `{"t":"pong","id":N,"at":MS,"echo":SERVER_MS}` | Reply to `ping`. `echo` is the server clock. |
+| `{"t":"role","role":"host\|guest"}` | Assigned role. Only sent when connecting without an explicit `role`. |
 | `{"t":"members","count":N}` | Sent to everyone on connect and on every membership change. |
 | `{"t":"error","reason":"..."}` | Fatal room error; the connection is then closed. |
 

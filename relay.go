@@ -63,7 +63,9 @@ func newHub(maxGuests int, ttl time.Duration) *hub {
 	return &hub{rooms: make(map[string]*room), maxGuests: maxGuests, ttl: ttl}
 }
 
-func (h *hub) join(code, role string, c *client) (*room, error) {
+// join adds c to a room. An empty role means "auto": c becomes host when the
+// room has none, otherwise a guest. It returns the role c was granted.
+func (h *hub) join(code, role string, c *client) (*room, string, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -73,9 +75,17 @@ func (h *hub) join(code, role string, c *client) (*room, error) {
 		h.rooms[code] = r
 	}
 
+	if role == "" {
+		if r.host == nil {
+			role = roleHost
+		} else {
+			role = roleGuest
+		}
+	}
+
 	if role == roleHost {
 		if r.host != nil {
-			return nil, errors.New("room already has a host")
+			return nil, "", errors.New("room already has a host")
 		}
 		r.host = c
 		if r.timer != nil {
@@ -84,12 +94,13 @@ func (h *hub) join(code, role string, c *client) (*room, error) {
 		}
 	} else {
 		if len(r.guests) >= h.maxGuests {
-			return nil, errors.New("room is full")
+			return nil, "", errors.New("room is full")
 		}
 		r.guests[c] = struct{}{}
 	}
+	c.role = role
 	c.room = r
-	return r, nil
+	return r, role, nil
 }
 
 // leave removes c from its room and returns the room if it still lives.
