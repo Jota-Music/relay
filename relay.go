@@ -1,11 +1,8 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
-	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -13,25 +10,9 @@ import (
 )
 
 const (
-	roleHost   = "host"
-	roleGuest  = "guest"
-	maxCodeLen = 64
+	roleHost  = "host"
+	roleGuest = "guest"
 )
-
-type client struct {
-	conn *websocket.Conn
-	role string
-	room *room
-	mu   sync.Mutex
-}
-
-func (c *client) send(data []byte) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.conn.Write(ctx, websocket.MessageText, data)
-}
 
 type room struct {
 	code   string
@@ -187,111 +168,4 @@ func (h *hub) replay(r *room, c *client) {
 	if state != nil {
 		_ = c.send(state)
 	}
-}
-
-func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
-	code := strings.TrimSpace(r.URL.Query().Get("room"))
-	role := r.URL.Query().Get("role")
-	if !validCode(code) {
-		http.Error(w, "invalid room", http.StatusBadRequest)
-		return
-	}
-	if role != roleHost && role != roleGuest {
-		http.Error(w, "invalid role", http.StatusBadRequest)
-		return
-	}
-
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: []string{"*"},
-	})
-	if err != nil {
-		return
-	}
-
-	c := &client{conn: conn, role: role}
-	rm, err := h.join(code, role, c)
-	if err != nil {
-		msg, _ := json.Marshal(map[string]any{"t": "error", "reason": err.Error()})
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_ = conn.Write(ctx, websocket.MessageText, msg)
-		cancel()
-		conn.Close(websocket.StatusPolicyViolation, err.Error())
-		return
-	}
-
-	h.sendMembers(rm)
-	h.replay(rm, c)
-	h.readLoop(c, rm)
-}
-
-func (h *hub) readLoop(c *client, r *room) {
-	defer func() {
-		rm := h.leave(c)
-		c.conn.Close(websocket.StatusNormalClosure, "")
-		if rm != nil {
-			h.sendMembers(rm)
-		}
-	}()
-
-	for {
-		_, data, err := c.conn.Read(context.Background())
-		if err != nil {
-			return
-		}
-
-		var head struct {
-			T string `json:"t"`
-		}
-		if json.Unmarshal(data, &head) != nil {
-			continue
-		}
-
-		if head.T == "ping" {
-			var p struct {
-				ID int   `json:"id"`
-				At int64 `json:"at"`
-			}
-			_ = json.Unmarshal(data, &p)
-			pong, _ := json.Marshal(map[string]any{
-				"t":    "pong",
-				"id":   p.ID,
-				"at":   p.At,
-				"echo": time.Now().UnixMilli(),
-			})
-			_ = c.send(pong)
-			continue
-		}
-
-		if head.T == "state" || head.T == "queue" {
-			h.mu.Lock()
-			if h.rooms[r.code] == r {
-				r.cache[head.T] = append(json.RawMessage(nil), data...)
-			}
-			h.mu.Unlock()
-		}
-
-		h.mu.Lock()
-		targets := r.others(c)
-		h.mu.Unlock()
-		for _, t := range targets {
-			_ = t.send(data)
-		}
-	}
-}
-
-func validCode(code string) bool {
-	if len(code) == 0 || len(code) > maxCodeLen {
-		return false
-	}
-	for _, r := range code {
-		switch {
-		case r >= 'a' && r <= 'z',
-			r >= 'A' && r <= 'Z',
-			r >= '0' && r <= '9',
-			r == '-', r == '_':
-		default:
-			return false
-		}
-	}
-	return true
 }
