@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -15,7 +16,34 @@ const (
 	maxMessageBytes = 16 << 20
 )
 
+// authorized reports whether r may open a WebSocket. With no token configured
+// the relay is open, mirroring the previous behaviour.
+func (h *hub) authorized(r *http.Request) bool {
+	if h.token == "" {
+		return true
+	}
+	got := bearerToken(r)
+	if got == "" {
+		got = r.URL.Query().Get("token")
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(h.token)) == 1
+}
+
+func bearerToken(r *http.Request) string {
+	const prefix = "bearer "
+	header := r.Header.Get("Authorization")
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(header[len(prefix):])
+}
+
 func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
+	if !h.authorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	code := strings.TrimSpace(r.URL.Query().Get("room"))
 	role := r.URL.Query().Get("role")
 	if !validCode(code) {

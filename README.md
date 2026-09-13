@@ -22,6 +22,12 @@ Configuration (environment variables):
 | `PORT` | `8080` | HTTP listen port. |
 | `MAX_GUESTS` | `8` | Max guests per room (host not counted). |
 | `ROOM_TTL` | `10m` | How long a room survives without a host before it is closed. |
+| `AUTH_TOKEN` | _(empty)_ | Shared secret required on `/ws`. Empty disables auth (relay is open). |
+
+When `AUTH_TOKEN` is set, clients must send it as `Authorization: Bearer <token>`
+(or `?token=<token>`). Requests without a valid token get `401` before the WebSocket
+upgrade. `/healthz` stays open. The Jota app exposes a "Token" field and embeds it in
+the shared invite, so guests never type it.
 
 Put it behind TLS (Caddy/nginx) so clients can use `wss://`. The app accepts either
 `wss://relay.example.com` or `https://relay.example.com` (the `/ws` path is added

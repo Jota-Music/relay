@@ -14,13 +14,15 @@ func main() {
 	ttl := getdur("ROOM_TTL", 10*time.Minute)
 
 	h := newHub(maxGuests, ttl)
+	h.token = getenv("AUTH_TOKEN", "")
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", h.handleWS)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	log.Printf("relay listening on :%s (max_guests=%d room_ttl=%s)", port, maxGuests, ttl)
+	log.Printf("relay listening on :%s (max_guests=%d room_ttl=%s auth=%t)", port, maxGuests, ttl, h.token != "")
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatal(err)
 	}

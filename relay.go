@@ -57,6 +57,7 @@ type hub struct {
 	rooms     map[string]*room
 	maxGuests int
 	ttl       time.Duration
+	token     string
 }
 
 func newHub(maxGuests int, ttl time.Duration) *hub {

@@ -127,6 +127,34 @@ func TestAutoRole(t *testing.T) {
 	}
 }
 
+func TestAuthToken(t *testing.T) {
+	h := newHub(8, time.Minute)
+	h.token = "secret"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", h.handleWS)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?room=secure&role=host"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, resp, err := websocket.Dial(ctx, url, nil); err == nil ||
+		resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without token, got err=%v resp=%v", err, resp)
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+	conn, _, err := websocket.Dial(ctx2, url, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer secret"}},
+	})
+	if err != nil {
+		t.Fatalf("dial with token: %v", err)
+	}
+	conn.Close(websocket.StatusNormalClosure, "")
+}
+
 func TestLargeMessageRelayed(t *testing.T) {
 	srv := newTestServer(t)
 
