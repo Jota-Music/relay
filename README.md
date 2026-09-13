@@ -29,6 +29,9 @@ When `AUTH_TOKEN` is set, clients must send it as `Authorization: Bearer <token>
 upgrade. `/healthz` stays open. The Jota app exposes a "Token" field and embeds it in
 the shared invite, so guests never type it.
 
+`/healthz` returns `{"auth":true|false}` so clients can tell whether the relay
+requires a token before connecting; it never exposes the token itself.
+
 Rooms can additionally be protected with an optional **password**. The first member to
 join sets it; later joins must present the same value via `X-Room-Password` (or
 `?pass=`) or they get an `error` and the connection closes. An empty password leaves
