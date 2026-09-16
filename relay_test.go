@@ -14,12 +14,18 @@ import (
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	h := newHub(8, time.Minute)
+	_, srv := newTestHub(t, 8, time.Minute)
+	return srv
+}
+
+func newTestHub(t *testing.T, maxGuests int, ttl time.Duration) (*hub, *httptest.Server) {
+	t.Helper()
+	h := newHub(maxGuests, ttl)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", h.handleWS)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return srv
+	return h, srv
 }
 
 func dial(t *testing.T, base, room, role string) *websocket.Conn {
@@ -64,6 +70,22 @@ func read(t *testing.T, c *websocket.Conn) map[string]any {
 		t.Fatalf("unmarshal %q: %v", data, err)
 	}
 	return m
+}
+
+// readWithin reads with a short deadline and reports whether a frame arrived.
+func readWithin(t *testing.T, c *websocket.Conn, d time.Duration) (map[string]any, bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		return nil, false
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("unmarshal %q: %v", data, err)
+	}
+	return m, true
 }
 
 func send(t *testing.T, c *websocket.Conn, msg string) {
@@ -254,6 +276,123 @@ func TestConsensusLateJoinerDoesNotExtendRound(t *testing.T) {
 	}
 	if m := read(t, guest); m["t"] != "play" || m["gen"] != "g1" {
 		t.Fatalf("guest play = %v", m)
+	}
+}
+
+func TestMembersCarriesEpoch(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "epoch", roleHost)
+	m := read(t, host)
+	if m["t"] != "members" || m["epoch"] == "" || m["epoch"] == nil {
+		t.Fatalf("members epoch = %v", m)
+	}
+}
+
+func TestGuestCannotPublish(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "ro", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "ro", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	// A guest must not be able to inject playback state.
+	send(t, guest, `{"t":"state","at":1,"songId":"hack"}`)
+	send(t, guest, `{"t":"prepare","gen":"hack"}`)
+	if m, ok := readWithin(t, host, 300*time.Millisecond); ok {
+		t.Fatalf("guest message was forwarded: %v", m)
+	}
+}
+
+func TestConsensusReadyFailureStillReleases(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "fail-jam", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "fail-jam", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, host, `{"t":"prepare","gen":"g1"}`)
+	if m := read(t, guest); m["t"] != "prepare" {
+		t.Fatalf("relayed prepare = %v", m)
+	}
+	send(t, host, `{"t":"ready","gen":"g1","ok":true}`)
+	// The guest could not load: it must not stall the room.
+	send(t, guest, `{"t":"ready","gen":"g1","ok":false}`)
+
+	if m := read(t, host); m["t"] != "play" {
+		t.Fatalf("host play = %v", m)
+	}
+	if m := read(t, guest); m["t"] != "play" {
+		t.Fatalf("guest play = %v", m)
+	}
+}
+
+func TestReapClosesIdleClients(t *testing.T) {
+	h, srv := newTestHub(t, 8, time.Minute)
+
+	host := dial(t, srv.URL, "idle", roleHost)
+	read(t, host)
+
+	h.mu.Lock()
+	for _, r := range h.rooms {
+		for _, c := range r.all() {
+			c.lastSeen.Store(time.Now().Add(-time.Minute).UnixNano())
+		}
+	}
+	h.mu.Unlock()
+
+	h.reap()
+	if _, ok := readWithin(t, host, time.Second); ok {
+		t.Fatal("idle client should have been closed")
+	}
+}
+
+func TestHostLeftEndsRoom(t *testing.T) {
+	_, srv := newTestHub(t, 8, 100*time.Millisecond)
+
+	host := dial(t, srv.URL, "bye", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "bye", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	host.Close(websocket.StatusNormalClosure, "")
+
+	if m := read(t, guest); m["t"] != "members" {
+		t.Fatalf("guest members after host left = %v", m)
+	}
+	if m := read(t, guest); m["t"] != "error" {
+		t.Fatalf("expected host-left error, got %v", m)
+	}
+}
+
+func TestSnapshotRestampsAndFreshens(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "snap", roleHost)
+	read(t, host)
+
+	send(t, host, `{"t":"state","seq":1,"at":1,"playing":true,"positionMs":5000,"songId":"s1","index":0}`)
+	send(t, host, `{"t":"heartbeat","seq":2,"at":1,"playing":true,"positionMs":9000,"songId":"s1"}`)
+	time.Sleep(50 * time.Millisecond)
+
+	late := dial(t, srv.URL, "snap", roleGuest)
+	if m := read(t, late); m["t"] != "members" {
+		t.Fatalf("late members = %v", m)
+	}
+	m := read(t, late)
+	if m["t"] != "state" || m["songId"] != "s1" {
+		t.Fatalf("late snapshot = %v", m)
+	}
+	if m["positionMs"].(float64) != 9000 {
+		t.Fatalf("snapshot not freshened from heartbeat: %v", m["positionMs"])
+	}
+	if at, ok := m["at"].(float64); !ok || at < 1e12 {
+		t.Fatalf("snapshot at not re-stamped: %v", m["at"])
 	}
 }
 

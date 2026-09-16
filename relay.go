@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -8,8 +9,6 @@ import (
 	"errors"
 	"sync"
 	"time"
-
-	"github.com/coder/websocket"
 )
 
 const (
@@ -17,20 +16,40 @@ const (
 	roleGuest = "guest"
 )
 
+// round is one consensus attempt for the next track: the host announces a gen,
+// every member present at that moment answers (loaded or not), and the relay
+// releases the round once they all have. A member that fails to load answers
+// with ok=false so it cannot stall the room; a member that never answers is only
+// removed by the liveness sweep.
+type round struct {
+	gen      string
+	expected map[*client]bool
+	answers  map[*client]bool // value reports whether the member loaded the track
+}
+
+func (r *round) release() string {
+	if len(r.expected) == 0 || len(r.answers) < len(r.expected) {
+		return ""
+	}
+	return r.gen
+}
+
 type room struct {
 	code     string
 	host     *client
 	guests   map[*client]struct{}
-	cache    map[string]json.RawMessage
 	timer    *time.Timer
 	passHash string
 
-	// Consensus round for the next track: the host announces a generation with
-	// `prepare`, every member answers `ready`, and the relay broadcasts `play`
-	// once all of them have the track loaded.
-	pendingGen   string
-	pendingCount int
-	ready        map[*client]bool
+	// epoch identifies the current host session. It is regenerated whenever a
+	// host joins so stale playback from a previous host is rejected by clients.
+	epoch   string
+	pending *round
+
+	// Snapshot for late joiners: the host queue and its latest playback state,
+	// re-stamped with the relay clock so a newcomer projects the live position.
+	queue []byte
+	state []byte
 }
 
 func hashPass(p string) string {
@@ -38,11 +57,17 @@ func hashPass(p string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func newEpoch() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
 func newRoom(code string) *room {
 	return &room{
 		code:   code,
 		guests: make(map[*client]struct{}),
-		cache:  make(map[string]json.RawMessage),
+		epoch:  newEpoch(),
 	}
 }
 
@@ -52,6 +77,18 @@ func (r *room) members() int {
 		n++
 	}
 	return n
+}
+
+// all returns every member, host first.
+func (r *room) all() []*client {
+	out := make([]*client, 0, len(r.guests)+1)
+	if r.host != nil {
+		out = append(out, r.host)
+	}
+	for g := range r.guests {
+		out = append(out, g)
+	}
+	return out
 }
 
 // others returns every member except of. Pass nil to get all members.
@@ -114,6 +151,11 @@ func (h *hub) join(code, role, pass string, c *client) (*room, string, error) {
 			return nil, "", errors.New("room already has a host")
 		}
 		r.host = c
+		r.epoch = newEpoch()
+		// The snapshot belonged to the previous host session: drop it so a late
+		// joiner cannot apply stale playback under the new epoch.
+		r.queue = nil
+		r.state = nil
 		if r.timer != nil {
 			r.timer.Stop()
 			r.timer = nil
@@ -130,7 +172,9 @@ func (h *hub) join(code, role, pass string, c *client) (*room, string, error) {
 }
 
 // leave removes c from its room and returns the room if it still lives, plus the
-// generation to release if c's departure completed a consensus round.
+// generation to release if c's departure completed a consensus round. When the
+// host leaves with guests still in the room, the room is scheduled to end after
+// the grace period unless a host rejoins.
 func (h *hub) leave(c *client) (*room, string) {
 	h.mu.Lock()
 
@@ -149,15 +193,12 @@ func (h *hub) leave(c *client) (*room, string) {
 	c.room = nil
 
 	release := ""
-	if r.pendingGen != "" {
-		delete(r.ready, c)
-		if r.members() < r.pendingCount {
-			r.pendingCount = r.members()
-		}
-		if r.members() > 0 && len(r.ready) >= r.pendingCount {
-			release = r.pendingGen
-			r.pendingGen = ""
-			r.ready = nil
+	if r.pending != nil {
+		delete(r.pending.expected, c)
+		delete(r.pending.answers, c)
+		if gen := r.pending.release(); gen != "" {
+			r.pending = nil
+			release = gen
 		}
 	}
 
@@ -167,48 +208,62 @@ func (h *hub) leave(c *client) (*room, string) {
 		return nil, ""
 	}
 	if r.host == nil && r.timer == nil {
-		r.timer = time.AfterFunc(h.ttl, func() { h.expire(r) })
+		r.timer = time.AfterFunc(h.ttl, func() { h.endRoom(r) })
 	}
 	h.mu.Unlock()
 	return r, release
 }
 
-// startRound opens a consensus round for gen. The member count is frozen here so
-// a late joiner cannot extend a round it never received a prepare for.
+// startRound opens a consensus round for gen over the members present right now,
+// so a late joiner cannot extend a round it never received a prepare for.
 func (h *hub) startRound(r *room, gen string) {
+	if r == nil || gen == "" {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.rooms[r.code] != r || gen == "" {
+	if h.rooms[r.code] != r {
 		return
 	}
-	r.pendingGen = gen
-	r.pendingCount = r.members()
-	r.ready = make(map[*client]bool)
+	expected := make(map[*client]bool, len(r.guests)+1)
+	for _, c := range r.all() {
+		expected[c] = true
+	}
+	r.pending = &round{gen: gen, expected: expected, answers: make(map[*client]bool)}
 }
 
-// markReady records c's ack for the round and releases it once every expected
-// member has answered.
-func (h *hub) markReady(c *client, r *room, gen string) {
+// markReady records c's answer for the round and releases it once every expected
+// member has answered (ok=false members count as answered, so they never stall).
+func (h *hub) markReady(c *client, r *room, gen string, ok bool) {
 	h.mu.Lock()
-	if h.rooms[r.code] != r || r.pendingGen == "" || gen != r.pendingGen {
+	if h.rooms[r.code] != r || r.pending == nil || gen != r.pending.gen || !r.pending.expected[c] {
 		h.mu.Unlock()
 		return
 	}
-	r.ready[c] = true
-	if len(r.ready) < r.pendingCount {
-		h.mu.Unlock()
-		return
+	r.pending.answers[c] = ok
+	release := r.pending.release()
+	var targets []*client
+	epoch := r.epoch
+	if release != "" {
+		r.pending = nil
+		targets = r.others(nil)
 	}
-	r.pendingGen = ""
-	r.ready = nil
-	targets := r.others(nil)
 	h.mu.Unlock()
 
-	h.play(targets, gen)
+	if release != "" {
+		h.play(targets, release, epoch)
+	}
 }
 
-func (h *hub) play(targets []*client, gen string) {
-	msg, _ := json.Marshal(map[string]any{"t": "play", "gen": gen})
+// play releases a round: everyone starts the announced track together.
+func (h *hub) play(targets []*client, gen, epoch string) {
+	msg, _ := json.Marshal(map[string]any{
+		"t":          "play",
+		"gen":        gen,
+		"epoch":      epoch,
+		"at":         time.Now().UnixMilli(),
+		"positionMs": 0,
+	})
 	for _, t := range targets {
 		_ = t.send(msg)
 	}
@@ -221,12 +276,14 @@ func (h *hub) broadcastPlay(r *room, gen string) {
 		h.mu.Unlock()
 		return
 	}
+	epoch := r.epoch
 	targets := r.others(nil)
 	h.mu.Unlock()
-	h.play(targets, gen)
+	h.play(targets, gen, epoch)
 }
 
-func (h *hub) expire(r *room) {
+// endRoom closes the room and tells the guests the host never came back.
+func (h *hub) endRoom(r *room) {
 	h.mu.Lock()
 	if h.rooms[r.code] != r {
 		h.mu.Unlock()
@@ -242,7 +299,27 @@ func (h *hub) expire(r *room) {
 	msg, _ := json.Marshal(map[string]any{"t": "error", "reason": "host left"})
 	for _, g := range orphans {
 		_ = g.send(msg)
-		g.conn.Close(websocket.StatusGoingAway, "host left")
+		g.closeAfterFlush(500 * time.Millisecond)
+	}
+}
+
+// reap closes clients that stopped answering, so a dead connection can never
+// hold a consensus round open forever.
+func (h *hub) reap() {
+	now := time.Now()
+	h.mu.Lock()
+	var stale []*client
+	for _, r := range h.rooms {
+		for _, c := range r.all() {
+			if now.Sub(c.seen()) > idleTimeout {
+				stale = append(stale, c)
+			}
+		}
+	}
+	h.mu.Unlock()
+
+	for _, c := range stale {
+		c.close()
 	}
 }
 
@@ -253,25 +330,77 @@ func (h *hub) sendMembers(r *room) {
 		return
 	}
 	count := r.members()
+	epoch := r.epoch
 	targets := r.others(nil)
 	h.mu.Unlock()
 
-	msg, _ := json.Marshal(map[string]any{"t": "members", "count": count})
+	msg, _ := json.Marshal(map[string]any{"t": "members", "count": count, "epoch": epoch})
 	for _, c := range targets {
 		_ = c.send(msg)
 	}
 }
 
+// remember updates the late-joiner snapshot. Playback state is re-stamped with
+// the relay clock so a newcomer projects the live position, and heartbeats keep
+// that position fresh between state changes.
+func (h *hub) remember(r *room, typ string, data []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.rooms[r.code] != r {
+		return
+	}
+	switch typ {
+	case "queue":
+		r.queue = append([]byte(nil), data...)
+	case "state":
+		var m map[string]any
+		if json.Unmarshal(data, &m) != nil {
+			return
+		}
+		m["at"] = time.Now().UnixMilli()
+		if b, err := json.Marshal(m); err == nil {
+			r.state = b
+		}
+	case "heartbeat":
+		if r.state == nil {
+			return
+		}
+		var hb, st map[string]any
+		if json.Unmarshal(data, &hb) != nil || json.Unmarshal(r.state, &st) != nil {
+			return
+		}
+		if hb["songId"] != st["songId"] {
+			return
+		}
+		for _, k := range []string{"playing", "positionMs", "color", "binary"} {
+			if v, ok := hb[k]; ok {
+				st[k] = v
+			}
+		}
+		st["at"] = time.Now().UnixMilli()
+		if b, err := json.Marshal(st); err == nil {
+			r.state = b
+		}
+	}
+}
+
 func (h *hub) replay(r *room, c *client) {
 	h.mu.Lock()
-	queue := r.cache["queue"]
-	state := r.cache["state"]
+	if h.rooms[r.code] != r {
+		h.mu.Unlock()
+		return
+	}
+	queue := r.queue
+	state := r.state
+	pending := r.pending != nil
 	h.mu.Unlock()
 
 	if queue != nil {
 		_ = c.send(queue)
 	}
-	if state != nil {
+	// While a round is in flight the cached state is the previous track: sending
+	// it would start the newcomer on the wrong song, so it waits for the release.
+	if state != nil && !pending {
 		_ = c.send(state)
 	}
 }

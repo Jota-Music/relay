@@ -13,10 +13,19 @@ import (
 func main() {
 	port := cmp.Or(os.Getenv("PORT"), "8080")
 	maxGuests := getint("MAX_GUESTS", 8)
-	ttl := getdur("ROOM_TTL", 10*time.Minute)
+	// How long a room survives without its host before the jam ends. Long enough
+	// for an automatic reconnect, short enough to not linger.
+	ttl := getdur("ROOM_TTL", 30*time.Second)
 
 	h := newHub(maxGuests, ttl)
 	h.token = os.Getenv("AUTH_TOKEN")
+
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		for range ticker.C {
+			h.reap()
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", h.handleWS)

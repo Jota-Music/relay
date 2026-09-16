@@ -67,16 +67,17 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	conn.SetReadLimit(maxMessageBytes)
 
-	c := &client{conn: conn, role: role}
+	c := newClient(conn, role)
 	rm, assigned, err := h.join(code, role, pass, c)
 	if err != nil {
 		msg, _ := json.Marshal(map[string]any{"t": "error", "reason": err.Error()})
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = conn.Write(ctx, websocket.MessageText, msg)
 		cancel()
-		conn.Close(websocket.StatusPolicyViolation, err.Error())
+		c.close()
 		return
 	}
+	c.run()
 
 	if role == "" {
 		msg, _ := json.Marshal(map[string]any{"t": "role", "role": assigned})
