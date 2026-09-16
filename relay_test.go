@@ -198,6 +198,65 @@ func TestRoomPassword(t *testing.T) {
 	}
 }
 
+func TestConsensusPlay(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "jam", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "jam", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, host, `{"t":"prepare","gen":"g1","song":{"id":"s1"}}`)
+	if m := read(t, guest); m["t"] != "prepare" || m["gen"] != "g1" {
+		t.Fatalf("relayed prepare = %v", m)
+	}
+
+	send(t, host, `{"t":"ready","gen":"g1"}`)
+	send(t, guest, `{"t":"ready","gen":"g1"}`)
+
+	if m := read(t, host); m["t"] != "play" || m["gen"] != "g1" {
+		t.Fatalf("host play = %v", m)
+	}
+	if m := read(t, guest); m["t"] != "play" || m["gen"] != "g1" {
+		t.Fatalf("guest play = %v", m)
+	}
+}
+
+func TestConsensusLateJoinerDoesNotExtendRound(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "late-jam", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "late-jam", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, host, `{"t":"prepare","gen":"g1","song":{"id":"s1"}}`)
+	if m := read(t, guest); m["t"] != "prepare" {
+		t.Fatalf("relayed prepare = %v", m)
+	}
+
+	late := dial(t, srv.URL, "late-jam", roleGuest)
+	if m := read(t, late); m["t"] != "members" || m["count"].(float64) != 3 {
+		t.Fatalf("late members = %v", m)
+	}
+	read(t, host)
+	read(t, guest)
+
+	// The round was opened with two members: the late joiner must not be needed
+	// for it to release.
+	send(t, host, `{"t":"ready","gen":"g1"}`)
+	send(t, guest, `{"t":"ready","gen":"g1"}`)
+
+	if m := read(t, host); m["t"] != "play" || m["gen"] != "g1" {
+		t.Fatalf("host play = %v", m)
+	}
+	if m := read(t, guest); m["t"] != "play" || m["gen"] != "g1" {
+		t.Fatalf("guest play = %v", m)
+	}
+}
+
 func TestLargeMessageRelayed(t *testing.T) {
 	srv := newTestServer(t)
 

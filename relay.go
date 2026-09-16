@@ -24,6 +24,13 @@ type room struct {
 	cache    map[string]json.RawMessage
 	timer    *time.Timer
 	passHash string
+
+	// Consensus round for the next track: the host announces a generation with
+	// `prepare`, every member answers `ready`, and the relay broadcasts `play`
+	// once all of them have the track loaded.
+	pendingGen   string
+	pendingCount int
+	ready        map[*client]bool
 }
 
 func hashPass(p string) string {
@@ -122,14 +129,15 @@ func (h *hub) join(code, role, pass string, c *client) (*room, string, error) {
 	return r, role, nil
 }
 
-// leave removes c from its room and returns the room if it still lives.
-func (h *hub) leave(c *client) *room {
+// leave removes c from its room and returns the room if it still lives, plus the
+// generation to release if c's departure completed a consensus round.
+func (h *hub) leave(c *client) (*room, string) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	r := c.room
 	if r == nil {
-		return nil
+		h.mu.Unlock()
+		return nil, ""
 	}
 	if c.role == roleHost {
 		if r.host == c {
@@ -140,14 +148,82 @@ func (h *hub) leave(c *client) *room {
 	}
 	c.room = nil
 
+	release := ""
+	if r.pendingGen != "" {
+		delete(r.ready, c)
+		if r.members() < r.pendingCount {
+			r.pendingCount = r.members()
+		}
+		if r.members() > 0 && len(r.ready) >= r.pendingCount {
+			release = r.pendingGen
+			r.pendingGen = ""
+			r.ready = nil
+		}
+	}
+
 	if r.host == nil && len(r.guests) == 0 {
 		delete(h.rooms, r.code)
-		return nil
+		h.mu.Unlock()
+		return nil, ""
 	}
 	if r.host == nil && r.timer == nil {
 		r.timer = time.AfterFunc(h.ttl, func() { h.expire(r) })
 	}
-	return r
+	h.mu.Unlock()
+	return r, release
+}
+
+// startRound opens a consensus round for gen. The member count is frozen here so
+// a late joiner cannot extend a round it never received a prepare for.
+func (h *hub) startRound(r *room, gen string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.rooms[r.code] != r || gen == "" {
+		return
+	}
+	r.pendingGen = gen
+	r.pendingCount = r.members()
+	r.ready = make(map[*client]bool)
+}
+
+// markReady records c's ack for the round and releases it once every expected
+// member has answered.
+func (h *hub) markReady(c *client, r *room, gen string) {
+	h.mu.Lock()
+	if h.rooms[r.code] != r || r.pendingGen == "" || gen != r.pendingGen {
+		h.mu.Unlock()
+		return
+	}
+	r.ready[c] = true
+	if len(r.ready) < r.pendingCount {
+		h.mu.Unlock()
+		return
+	}
+	r.pendingGen = ""
+	r.ready = nil
+	targets := r.others(nil)
+	h.mu.Unlock()
+
+	h.play(targets, gen)
+}
+
+func (h *hub) play(targets []*client, gen string) {
+	msg, _ := json.Marshal(map[string]any{"t": "play", "gen": gen})
+	for _, t := range targets {
+		_ = t.send(msg)
+	}
+}
+
+// broadcastPlay releases a round to every room member.
+func (h *hub) broadcastPlay(r *room, gen string) {
+	h.mu.Lock()
+	if h.rooms[r.code] != r {
+		h.mu.Unlock()
+		return
+	}
+	targets := r.others(nil)
+	h.mu.Unlock()
+	h.play(targets, gen)
 }
 
 func (h *hub) expire(r *room) {

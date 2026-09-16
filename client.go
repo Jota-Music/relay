@@ -26,10 +26,13 @@ func (c *client) send(data []byte) error {
 
 func (h *hub) readLoop(c *client, r *room) {
 	defer func() {
-		rm := h.leave(c)
+		rm, gen := h.leave(c)
 		c.conn.Close(websocket.StatusNormalClosure, "")
 		if rm != nil {
 			h.sendMembers(rm)
+			if gen != "" {
+				h.broadcastPlay(rm, gen)
+			}
 		}
 	}()
 
@@ -46,7 +49,8 @@ func (h *hub) readLoop(c *client, r *room) {
 			continue
 		}
 
-		if head.T == "ping" {
+		switch head.T {
+		case "ping":
 			var p struct {
 				ID int   `json:"id"`
 				At int64 `json:"at"`
@@ -60,9 +64,20 @@ func (h *hub) readLoop(c *client, r *room) {
 			})
 			_ = c.send(pong)
 			continue
-		}
-
-		if head.T == "state" || head.T == "queue" {
+		case "prepare":
+			var p struct {
+				Gen string `json:"gen"`
+			}
+			_ = json.Unmarshal(data, &p)
+			h.startRound(r, p.Gen)
+		case "ready":
+			var p struct {
+				Gen string `json:"gen"`
+			}
+			_ = json.Unmarshal(data, &p)
+			h.markReady(c, r, p.Gen)
+			continue
+		case "state", "queue":
 			h.mu.Lock()
 			if h.rooms[r.code] == r {
 				r.cache[head.T] = append(json.RawMessage(nil), data...)

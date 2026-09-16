@@ -56,10 +56,19 @@ to the other members and understands only these control types:
 | Client → relay | `{"t":"state",...}` | Host playback state; cached as the room snapshot. |
 | Client → relay | `{"t":"queue",...}` | Host queue; cached as the room snapshot. |
 | Client → relay | `{"t":"heartbeat",...}` | Host heartbeat; forwarded. |
+| Client → relay | `{"t":"prepare","gen":"...","song":{...}}` | Host announces the next track; opens a consensus round and is forwarded. |
+| Client → relay | `{"t":"ready","gen":"..."}` | A member has the track loaded; consumed by the relay, never forwarded. |
 | Relay → client | `{"t":"pong","id":N,"at":MS,"echo":SERVER_MS}` | Reply to `ping`; `echo` is the server clock. |
 | Relay → client | `{"t":"role","role":"host\|guest"}` | Assigned role; only when connecting without one. |
 | Relay → client | `{"t":"members","count":N}` | Sent on connect and every membership change. |
+| Relay → client | `{"t":"play","gen":"..."}` | Round released: every expected member was ready; start the track now. |
 | Relay → client | `{"t":"error","reason":"..."}` | Fatal room error; sets the connection to close. |
+
+**Consensus.** A `prepare` freezes the member set and starts a round; every member
+(the host included) answers `ready` after loading the track, and the relay
+broadcasts `play` once they all have. A member joining after the `prepare` does
+not extend the round; a member leaving lowers the requirement, so a departure
+cannot stall playback. A `ready` for a stale generation is ignored.
 
 On connect the relay sends `members`, then replays the cached `queue` followed
 by the cached `state` (queue first so track indexes resolve).
