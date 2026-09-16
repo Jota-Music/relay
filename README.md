@@ -99,7 +99,7 @@ the previous track, so it is withheld and the newcomer waits for the release; on
 the round releases the relay promotes the announced next state into the snapshot,
 so a late joiner lands on the new track already playing.
 
-The `state`/`queue`/`heartbeat` shapes live in the Jota app, not here — see
+The `state`/`queue` shapes live in the Jota app, not here — see
 `frontend/src/lib/sync/model` in the Jota repo. Both sides must keep their JSON
 in sync.
 
