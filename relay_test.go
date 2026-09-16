@@ -116,6 +116,8 @@ func TestMembersSnapshotAndRelay(t *testing.T) {
 	send(t, host, `{"t":"state","at":1000,"songId":"abc"}`)
 	if m := read(t, guest); m["t"] != "state" || m["songId"] != "abc" {
 		t.Fatalf("relayed state = %v", m)
+	} else if at, ok := m["at"].(float64); !ok || at < 1e12 {
+		t.Fatalf("forwarded state not relay-stamped: %v", m["at"])
 	}
 
 	late := dial(t, srv.URL, "party", roleGuest)
@@ -331,6 +333,99 @@ func TestConsensusReadyFailureStillReleases(t *testing.T) {
 	}
 }
 
+// A released round must schedule a shared start instant: every member gets the
+// same future `at` and starts on it, not when its own frame arrives.
+func TestPlaySchedulesSharedStart(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "clocked", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "clocked", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	before := time.Now().UnixMilli()
+	send(t, host, `{"t":"prepare","gen":"g1","song":{"id":"s1"}}`)
+	read(t, guest)
+	send(t, host, `{"t":"ready","gen":"g1"}`)
+	send(t, guest, `{"t":"ready","gen":"g1"}`)
+
+	plays := map[string]map[string]any{"host": read(t, host), "guest": read(t, guest)}
+	for name, m := range plays {
+		if m["t"] != "play" || m["gen"] != "g1" {
+			t.Fatalf("%s play = %v", name, m)
+		}
+		if m["positionMs"].(float64) != 0 {
+			t.Fatalf("%s positionMs = %v", name, m["positionMs"])
+		}
+		if at := m["at"].(float64); at <= float64(before) {
+			t.Fatalf("%s at not scheduled ahead: %v", name, m["at"])
+		}
+	}
+	if plays["host"]["at"] != plays["guest"]["at"] {
+		t.Fatalf("start instants differ: %v", plays)
+	}
+}
+
+// A late joiner after a release must land on the new track, not the previous
+// snapshot: the relay promotes the pending prepare into the cached state.
+func TestReleasePromotesSnapshot(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "promote", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "promote", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, host, `{"t":"prepare","gen":"g1","songId":"s2","index":3,"song":{"id":"s2","name":"Next"}}`)
+	read(t, guest)
+	send(t, host, `{"t":"ready","gen":"g1"}`)
+	send(t, guest, `{"t":"ready","gen":"g1"}`)
+	play := read(t, host)
+	read(t, guest)
+
+	late := dial(t, srv.URL, "promote", roleGuest)
+	if m := read(t, late); m["t"] != "members" {
+		t.Fatalf("late members = %v", m)
+	}
+	m := read(t, late)
+	if m["t"] != "state" || m["songId"] != "s2" {
+		t.Fatalf("promoted snapshot = %v", m)
+	}
+	if m["index"].(float64) != 3 || m["playing"] != true || m["positionMs"].(float64) != 0 {
+		t.Fatalf("promoted snapshot fields = %v", m)
+	}
+	if m["at"] != play["at"] {
+		t.Fatalf("promoted at %v != play at %v", m["at"], play["at"])
+	}
+}
+
+// A host that stopped pinging may be evicted by the reconnecting host instead of
+// being demoted to guest.
+func TestHostReclaimWhenStale(t *testing.T) {
+	h, srv := newTestHub(t, 8, time.Minute)
+
+	first := dial(t, srv.URL, "reclaim", roleHost)
+	read(t, first)
+
+	h.mu.Lock()
+	for _, r := range h.rooms {
+		for _, c := range r.all() {
+			c.lastSeen.Store(time.Now().Add(-time.Minute).UnixNano())
+		}
+	}
+	h.mu.Unlock()
+
+	second := dial(t, srv.URL, "reclaim", roleHost)
+	if m := read(t, second); m["t"] != "members" || m["count"].(float64) != 1 {
+		t.Fatalf("reclaim members = %v", m)
+	}
+	if _, ok := readWithin(t, first, time.Second); ok {
+		t.Fatal("stale host should have been evicted")
+	}
+}
+
 func TestReapClosesIdleClients(t *testing.T) {
 	h, srv := newTestHub(t, 8, time.Minute)
 
@@ -370,14 +465,13 @@ func TestHostLeftEndsRoom(t *testing.T) {
 	}
 }
 
-func TestSnapshotRestampsAndFreshens(t *testing.T) {
+func TestSnapshotStampsRelayClock(t *testing.T) {
 	srv := newTestServer(t)
 
 	host := dial(t, srv.URL, "snap", roleHost)
 	read(t, host)
 
-	send(t, host, `{"t":"state","seq":1,"at":1,"playing":true,"positionMs":5000,"songId":"s1","index":0}`)
-	send(t, host, `{"t":"heartbeat","seq":2,"at":1,"playing":true,"positionMs":9000,"songId":"s1"}`)
+	send(t, host, `{"t":"state","rev":1,"at":1,"playing":true,"positionMs":5000,"songId":"s1","index":0}`)
 	time.Sleep(50 * time.Millisecond)
 
 	late := dial(t, srv.URL, "snap", roleGuest)
@@ -388,11 +482,34 @@ func TestSnapshotRestampsAndFreshens(t *testing.T) {
 	if m["t"] != "state" || m["songId"] != "s1" {
 		t.Fatalf("late snapshot = %v", m)
 	}
-	if m["positionMs"].(float64) != 9000 {
-		t.Fatalf("snapshot not freshened from heartbeat: %v", m["positionMs"])
-	}
 	if at, ok := m["at"].(float64); !ok || at < 1e12 {
-		t.Fatalf("snapshot at not re-stamped: %v", m["at"])
+		t.Fatalf("snapshot at not stamped by the relay: %v", m["at"])
+	}
+}
+
+// The cached state carries the whole track so a late joiner (or a guest that
+// missed the prepare) can load it without depending on its own queue. The relay
+// re-marshals state to re-stamp `at`, so this guards the nested payload survives.
+func TestSnapshotKeepsTrack(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "track", roleHost)
+	read(t, host)
+
+	send(t, host, `{"t":"state","seq":1,"at":1,"playing":true,"positionMs":0,"songId":"s1","index":0,"song":{"id":"s1","name":"Track"}}`)
+	time.Sleep(50 * time.Millisecond)
+
+	late := dial(t, srv.URL, "track", roleGuest)
+	if m := read(t, late); m["t"] != "members" {
+		t.Fatalf("late members = %v", m)
+	}
+	m := read(t, late)
+	if m["t"] != "state" || m["songId"] != "s1" {
+		t.Fatalf("late snapshot = %v", m)
+	}
+	song, ok := m["song"].(map[string]any)
+	if !ok || song["id"] != "s1" {
+		t.Fatalf("snapshot dropped the track: %v", m)
 	}
 }
 

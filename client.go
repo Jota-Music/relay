@@ -63,6 +63,18 @@ func (c *client) seen() time.Time {
 	return time.Unix(0, c.lastSeen.Load())
 }
 
+// closed reports whether the client has been shut down, even before the hub has
+// processed its departure. A reconnecting host closes its old socket first, so
+// this lets the relay reclaim the room deterministically.
+func (c *client) closed() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
+}
+
 // send enqueues a frame, never blocking the caller. A full queue means the peer
 // is too slow, so it is dropped.
 func (c *client) send(data []byte) error {
@@ -122,13 +134,10 @@ func (c *client) closeAfterFlush(timeout time.Duration) {
 
 func (h *hub) readLoop(c *client, r *room) {
 	defer func() {
-		rm, gen := h.leave(c)
+		rm := h.leave(c)
 		c.close()
 		if rm != nil {
 			h.sendMembers(rm)
-			if gen != "" {
-				h.broadcastPlay(rm, gen)
-			}
 		}
 	}()
 
@@ -178,12 +187,17 @@ func (h *hub) readLoop(c *client, r *room) {
 				Gen string `json:"gen"`
 			}
 			_ = json.Unmarshal(data, &p)
-			h.startRound(r, p.Gen)
-		case "state", "queue", "heartbeat":
+			h.startRound(r, p.Gen, data)
+		case "state", "queue":
 			if c.role != roleHost {
 				continue
 			}
-			h.remember(r, head.T, data)
+			// Forward the relay-stamped frame, not the host's local clock.
+			out := h.remember(r, head.T, data)
+			if out == nil {
+				continue
+			}
+			data = out
 		}
 
 		h.mu.Lock()

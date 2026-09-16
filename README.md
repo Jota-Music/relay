@@ -25,6 +25,7 @@ docker run -e PORT=8080 -p 8080:8080 ghcr.io/jota-music/relay
 | `PORT` | `8080` | HTTP listen port. |
 | `MAX_GUESTS` | `8` | Max guests per room (host not counted). |
 | `ROOM_TTL` | `30s` | Grace before a room without its host ends the jam. |
+| `PLAY_LEAD` | `800ms` | Lead time between releasing a round and the scheduled start. |
 | `AUTH_TOKEN` | _(empty)_ | Shared secret for `/ws`; empty keeps the relay open. |
 
 **Auth.** With `AUTH_TOKEN` set, clients send `Authorization: Bearer <token>`
@@ -53,39 +54,50 @@ other members, but only the host may publish playback:
 | Direction | Message | Description |
 |-----------|---------|-------------|
 | Client → relay | `{"t":"ping","id":N,"at":MS}` | Clock sync; answered locally, never forwarded. |
-| Client → relay | `{"t":"state",...}` | Host playback state; cached as the room snapshot. |
+| Client → relay | `{"t":"state",...}` | Host playback state; stamped with the relay clock and cached as the room snapshot. |
 | Client → relay | `{"t":"queue",...}` | Host queue; cached as the room snapshot. |
-| Client → relay | `{"t":"heartbeat",...}` | Host heartbeat; forwarded. |
-| Client → relay | `{"t":"prepare","gen":"...","song":{...}}` | Host announces the next track; opens a consensus round and is forwarded. |
+| Client → relay | `{"t":"prepare","gen":"...","song":{...},...}` | Host announces the next track with its full next state; opens a consensus round and is forwarded. |
 | Client → relay | `{"t":"ready","gen":"...","ok":BOOL}` | A member answered the round. `ok=false` means it could not load and must not stall the room. Consumed, never forwarded. |
 | Client → relay | `{"t":"control",...}` | Guest request; forwarded to the host. |
 | Relay → client | `{"t":"pong","id":N,"at":MS,"echo":SERVER_MS}` | Reply to `ping`; `echo` is the server clock. |
 | Relay → client | `{"t":"role","role":"host\|guest"}` | Assigned role; only when connecting without one. |
 | Relay → client | `{"t":"members","count":N,"epoch":"..."}` | Sent on connect and every membership change. `epoch` identifies the current host session. |
-| Relay → client | `{"t":"play","gen":"...","epoch":"...","at":MS,"positionMs":0}` | Round released: every expected member answered; start the track now. |
+| Relay → client | `{"t":"play","gen":"...","epoch":"...","at":MS,"positionMs":0}` | Round released: every expected member answered. `at` is a future relay time; start the track then, together. |
 | Relay → client | `{"t":"error","reason":"..."}` | Fatal room error; the connection then closes. |
 
-**Host-only.** `prepare`, `state`, `queue` and `heartbeat` are dropped unless the
-sender is the host. Guests only send `ready` and `control`.
+**Host-only.** `prepare`, `state` and `queue` are dropped unless the sender is the
+host. Guests only send `ready` and `control`.
+
+**The relay is the room clock.** It stamps `at` on every state and on the released
+`play`, so every member schedules against the relay clock and only needs its own
+offset. The host never has to trust its local clock.
 
 **Consensus.** A `prepare` freezes the member set and starts a round; every member
 (the host included) answers `ready`, and the relay broadcasts `play` once they all
-have. A member joining after the `prepare` does not extend the round; a member
-leaving lowers the requirement. A member that cannot load answers `ok=false`, so
-the room never waits on it forever. A member that stops answering is dropped by a
-liveness sweep (`ping` is expected every second), and its departure unblocks the
-round. A `ready` for a stale generation is ignored.
+have. `play` carries a shared start instant (`at`, `PLAY_LEAD` ahead) and a
+`positionMs` of 0, so host and guests start the loaded track at the same wall-clock
+moment instead of when each frame arrives. A member joining after the `prepare`
+does not extend the round; a member leaving lowers the requirement. A member that
+cannot load answers `ok=false`, so the room never waits on it forever. A member
+that stops answering is dropped by a liveness sweep (`ping` is expected every
+second), and its departure unblocks the round. A `ready` for a stale generation is
+ignored.
 
 **Rooms.** When the host disconnects the room waits `ROOM_TTL` for it to come back;
-if it does not, the jam ends and the guests are told `host left`. Rooms are
-ephemeral: a relay restart drops them and clients recreate the room on reconnect.
+if it does not, the jam ends and the guests are told `host left`. A host that
+reconnects after falling silent is allowed to reclaim the room, evicting the stale
+connection instead of being demoted to guest. Rooms are ephemeral: a relay restart
+drops them and clients recreate the room on reconnect.
 
 On connect the relay sends `members`, then replays the cached `queue` followed by
 the cached `state` (queue first so track indexes resolve). The replayed `state`
-is re-stamped with the relay clock and kept fresh from the host heartbeats, so a
+is stamped with the relay clock and kept fresh by the host's periodic states, so a
 late joiner projects the live position and catches up without touching anyone
-else. While a consensus round is in flight the cached state belongs to the
-previous track, so it is withheld and the newcomer waits for the release.
+else. It also carries the full track, so a newcomer can load it without depending
+on its own queue. While a consensus round is in flight the cached state belongs to
+the previous track, so it is withheld and the newcomer waits for the release; once
+the round releases the relay promotes the announced next state into the snapshot,
+so a late joiner lands on the new track already playing.
 
 The `state`/`queue`/`heartbeat` shapes live in the Jota app, not here — see
 `frontend/src/lib/sync/model` in the Jota repo. Both sides must keep their JSON

@@ -18,6 +18,7 @@ func main() {
 	ttl := getdur("ROOM_TTL", 30*time.Second)
 
 	h := newHub(maxGuests, ttl)
+	h.lead = getdur("PLAY_LEAD", defaultLead)
 	h.token = os.Getenv("AUTH_TOKEN")
 
 	go func() {
