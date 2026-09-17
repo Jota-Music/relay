@@ -22,6 +22,9 @@ const (
 
 	defaultLead        = 800 * time.Millisecond
 	defaultJoinTimeout = 1500 * time.Millisecond
+	// maxJoinDeferrals bounds how many join timeouts a round in flight may push
+	// back before the relay gives up and answers from the cache anyway.
+	maxJoinDeferrals = 8
 )
 
 // round is one consensus attempt for the next track: a member announces a gen
@@ -41,10 +44,11 @@ type round struct {
 // arrival, has the host answer with its live playback, and stamps t2 on the way
 // out so the joiner can compute its clock offset (NTP over four timestamps).
 type pendingJoin struct {
-	c     *client
-	t0    int64
-	t1    int64
-	timer *time.Timer
+	c         *client
+	t0        int64
+	t1        int64
+	deferrals int
+	timer     *time.Timer
 }
 
 // outbound is a frame addressed to a single client, sent after the hub lock is
@@ -436,13 +440,26 @@ func (h *hub) expireJoin(r *room, id string) {
 		return
 	}
 	pj := r.joins[id]
+	if pj == nil {
+		h.mu.Unlock()
+		return
+	}
+	// A round in flight owns the next state, so the cache still holds the
+	// outgoing track: answering now would strand the newcomer there. Defer until
+	// the round releases (flushJoinsLocked answers from the promoted state) or
+	// the liveness sweep drops the silent member. Only after a bounded number of
+	// deferrals is the cache sent as a last resort.
+	if r.pending != nil && pj.deferrals < maxJoinDeferrals {
+		pj.deferrals++
+		pj.timer = time.AfterFunc(h.joinTimeout, func() { h.expireJoin(r, id) })
+		h.mu.Unlock()
+		return
+	}
 	delete(r.joins, id)
 	queue := r.queue
 	state := r.state
 	h.mu.Unlock()
-	if pj != nil {
-		_ = pj.c.send(buildSnapshot(pj.t1, time.Now().UnixMilli(), queue, state))
-	}
+	_ = pj.c.send(buildSnapshot(pj.t1, time.Now().UnixMilli(), queue, state))
 }
 
 // flushJoinsLocked answers every waiting joiner from the current snapshot and

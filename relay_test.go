@@ -351,6 +351,47 @@ func TestJoinDuringRoundGetsPromotedTrack(t *testing.T) {
 	}
 }
 
+// A join arriving while a round is in flight must not be answered from the cache
+// (which still holds the outgoing track); the fallback defers until the release.
+func TestJoinFallbackDefersWhileRoundPending(t *testing.T) {
+	h, srv := newTestHub(t, 8, time.Minute)
+	h.joinTimeout = 50 * time.Millisecond
+
+	host := dial(t, srv.URL, "defer-fallback", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "defer-fallback", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, host, `{"t":"prepare","gen":"g1","songId":"s2","song":{"id":"s2"}}`)
+	read(t, guest)
+
+	late := dial(t, srv.URL, "defer-fallback", roleGuest)
+	if m := read(t, late); m["t"] != "members" {
+		t.Fatalf("late members = %v", m)
+	}
+	send(t, late, `{"t":"join","at":1000}`)
+
+	// Past several join timeouts: a fallback that answered mid-round would have
+	// delivered the cached (outgoing) state by now.
+	time.Sleep(120 * time.Millisecond)
+
+	send(t, host, `{"t":"ready","gen":"g1"}`)
+	send(t, guest, `{"t":"ready","gen":"g1"}`)
+
+	if m := read(t, late); m["t"] != "play" {
+		t.Fatalf("late first frame = %v, want play (no stale snapshot)", m)
+	}
+	m := read(t, late)
+	if m["t"] != "snapshot" {
+		t.Fatalf("late snapshot = %v", m)
+	}
+	state, ok := m["state"].(map[string]any)
+	if !ok || state["songId"] != "s2" {
+		t.Fatalf("late snapshot state = %v", m)
+	}
+}
+
 // A second prepare while a round is open is refused and not forwarded, so a
 // simultaneous track change cannot fork the room.
 func TestConcurrentPrepareKeepsFirstRound(t *testing.T) {
