@@ -157,7 +157,9 @@ func (h *hub) sendOut(out []outbound) {
 // endRoom closes the room and tells the guests the host never came back.
 func (h *hub) endRoom(r *room) {
 	h.mu.Lock()
-	if h.rooms[r.code] != r {
+	if h.rooms[r.code] != r || r.host != nil {
+		// A host that reconnected just as the timer fired reclaims the room; its
+		// join stopped the timer, but a fired timer cannot be cancelled.
 		h.mu.Unlock()
 		return
 	}
