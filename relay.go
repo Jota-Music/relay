@@ -20,10 +20,11 @@ const (
 	// never replaced; a dead one is reclaimed within a few seconds.
 	hostStale = 5 * time.Second
 
-	defaultLead = 800 * time.Millisecond
+	defaultLead        = 800 * time.Millisecond
+	defaultJoinTimeout = 1500 * time.Millisecond
 )
 
-// round is one consensus attempt for the next track: the host announces a gen
+// round is one consensus attempt for the next track: a member announces a gen
 // with the full next state, every member present at that moment answers (loaded
 // or not), and the relay releases the round once they all have. It releases on a
 // shared instant so every member starts together instead of on frame arrival.
@@ -34,6 +35,23 @@ type round struct {
 	next     []byte
 	expected map[*client]bool
 	answers  map[*client]bool
+}
+
+// pendingJoin is a member waiting for the room snapshot. The relay stamps t1 on
+// arrival, has the host answer with its live playback, and stamps t2 on the way
+// out so the joiner can compute its clock offset (NTP over four timestamps).
+type pendingJoin struct {
+	c     *client
+	t0    int64
+	t1    int64
+	timer *time.Timer
+}
+
+// outbound is a frame addressed to a single client, sent after the hub lock is
+// released.
+type outbound struct {
+	c   *client
+	msg []byte
 }
 
 type room struct {
@@ -48,10 +66,13 @@ type room struct {
 	epoch   string
 	pending *round
 
-	// Snapshot for late joiners: the host queue and its latest playback state,
-	// stamped with the relay clock so a newcomer projects the live position.
-	queue []byte
+	// Snapshot for joiners: the shared queue as serialized by a member and the
+	// host playback object, relay-stamped. Both are injected into a join reply.
+	queue string
 	state []byte
+
+	// joins holds the members waiting for that snapshot, keyed by client id.
+	joins map[string]*pendingJoin
 }
 
 func hashPass(p string) string {
@@ -65,11 +86,18 @@ func newEpoch() string {
 	return hex.EncodeToString(b[:])
 }
 
+func newID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
 func newRoom(code string) *room {
 	return &room{
 		code:   code,
 		guests: make(map[*client]struct{}),
 		epoch:  newEpoch(),
+		joins:  make(map[string]*pendingJoin),
 	}
 }
 
@@ -108,20 +136,22 @@ func (r *room) others(of *client) []*client {
 }
 
 type hub struct {
-	mu        sync.Mutex
-	rooms     map[string]*room
-	maxGuests int
-	ttl       time.Duration
-	lead      time.Duration
-	token     string
+	mu          sync.Mutex
+	rooms       map[string]*room
+	maxGuests   int
+	ttl         time.Duration
+	lead        time.Duration
+	joinTimeout time.Duration
+	token       string
 }
 
 func newHub(maxGuests int, ttl time.Duration) *hub {
 	return &hub{
-		rooms:     make(map[string]*room),
-		maxGuests: maxGuests,
-		ttl:       ttl,
-		lead:      defaultLead,
+		rooms:       make(map[string]*room),
+		maxGuests:   maxGuests,
+		ttl:         ttl,
+		lead:        defaultLead,
+		joinTimeout: defaultJoinTimeout,
 	}
 }
 
@@ -171,7 +201,7 @@ func (h *hub) join(code, role, pass string, c *client) (*room, string, error) {
 		// The snapshot and any in-flight round belonged to the previous host
 		// session: drop them so a late joiner cannot apply stale playback under
 		// the new epoch.
-		r.queue = nil
+		r.queue = ""
 		r.state = nil
 		r.pending = nil
 		if r.timer != nil {
@@ -192,7 +222,8 @@ func (h *hub) join(code, role, pass string, c *client) (*room, string, error) {
 // leave removes c from its room and returns the room if it still lives. When the
 // host leaves with guests still in the room, the room is scheduled to end after
 // the grace period unless a host rejoins. A departure that completes a consensus
-// round releases it to the remaining members.
+// round releases it to the remaining members, and a host departure flushes any
+// joiner waiting on an answer that will never come.
 func (h *hub) leave(c *client) *room {
 	h.mu.Lock()
 
@@ -211,10 +242,14 @@ func (h *hub) leave(c *client) *room {
 	c.room = nil
 
 	var play []byte
+	var out []outbound
 	if r.pending != nil {
 		delete(r.pending.expected, c)
 		delete(r.pending.answers, c)
-		play = h.finishRoundLocked(r)
+		play, out = h.finishRoundLocked(r)
+	}
+	if c.role == roleHost && r.host == nil {
+		out = append(out, h.flushJoinsLocked(r)...)
 	}
 	var targets []*client
 	if play != nil {
@@ -234,21 +269,27 @@ func (h *hub) leave(c *client) *room {
 	if play != nil {
 		h.sendAll(targets, play)
 	}
+	h.sendOut(out)
 	return r
 }
 
 // startRound opens a consensus round for gen over the members present right now,
 // so a late joiner cannot extend a round it never received a prepare for. next is
-// the host's prepare payload: the full next state, promoted to the room snapshot
-// when the round releases.
-func (h *hub) startRound(r *room, gen string, next []byte) {
+// the announcing member's prepare payload: the full next state, promoted to the
+// room snapshot when the round releases. A second prepare while a round is in
+// flight is refused (and not forwarded), so concurrent track changes resolve to
+// a single round.
+func (h *hub) startRound(r *room, gen string, next []byte) bool {
 	if r == nil || gen == "" {
-		return
+		return false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.rooms[r.code] != r {
-		return
+		return false
+	}
+	if r.pending != nil {
+		return false
 	}
 	expected := make(map[*client]bool, len(r.guests)+1)
 	for _, c := range r.all() {
@@ -260,19 +301,20 @@ func (h *hub) startRound(r *room, gen string, next []byte) {
 		expected: expected,
 		answers:  make(map[*client]bool),
 	}
+	return true
 }
 
 // finishRoundLocked releases the pending round once everyone expected has
 // answered, promoting its next state to the room snapshot so a late joiner lands
-// on the new track, and returns the `play` frame to broadcast. The caller holds
-// h.mu. It returns nil when the round is not ready.
-func (h *hub) finishRoundLocked(r *room) []byte {
+// on the new track, and returns the `play` frame plus any deferred join replies.
+// The caller holds h.mu, and must send the frames after unlocking.
+func (h *hub) finishRoundLocked(r *room) ([]byte, []outbound) {
 	p := r.pending
 	if p == nil {
-		return nil
+		return nil, nil
 	}
 	if len(p.expected) != 0 && len(p.answers) < len(p.expected) {
-		return nil
+		return nil, nil
 	}
 	r.pending = nil
 
@@ -298,7 +340,9 @@ func (h *hub) finishRoundLocked(r *room) []byte {
 		"at":         at,
 		"positionMs": 0,
 	})
-	return msg
+	// A joiner held back by this round waits for its release: hand it the track
+	// the room is actually starting on, not the outgoing one.
+	return msg, h.flushJoinsLocked(r)
 }
 
 // markReady records c's answer for the round and releases it once every expected
@@ -310,7 +354,7 @@ func (h *hub) markReady(c *client, r *room, gen string, ok bool) {
 		return
 	}
 	r.pending.answers[c] = ok
-	msg := h.finishRoundLocked(r)
+	msg, out := h.finishRoundLocked(r)
 	var targets []*client
 	if msg != nil {
 		targets = r.all()
@@ -320,11 +364,115 @@ func (h *hub) markReady(c *client, r *room, gen string, ok bool) {
 	if msg != nil {
 		h.sendAll(targets, msg)
 	}
+	h.sendOut(out)
+}
+
+// joinRequest answers a member asking for the room snapshot. The relay stamps t1,
+// forwards the request to the host (t0/t1/from), and the host answers with its
+// live playback; the relay stamps t2 on the way out. With no host to ask (the
+// joiner is the host, or the room has none) it replies from the cache.
+func (h *hub) joinRequest(r *room, c *client, t0 int64) {
+	h.mu.Lock()
+	if h.rooms[r.code] != r {
+		h.mu.Unlock()
+		return
+	}
+	t1 := time.Now().UnixMilli()
+	host := r.host
+	if host == nil || host == c {
+		queue := r.queue
+		state := r.state
+		h.mu.Unlock()
+		_ = c.send(buildSnapshot(t1, time.Now().UnixMilli(), queue, state))
+		return
+	}
+	pj := &pendingJoin{c: c, t0: t0, t1: t1}
+	pj.timer = time.AfterFunc(h.joinTimeout, func() { h.expireJoin(r, c.id) })
+	r.joins[c.id] = pj
+	// A round is in flight: its release is the authoritative next state, so hold
+	// the join instead of answering with the track that is being replaced.
+	pending := r.pending != nil
+	h.mu.Unlock()
+
+	if pending {
+		return
+	}
+	_ = host.send(joinForward(t0, t1, c.id))
+}
+
+// joinAnswer routes the host's playback to the waiting joiner, stamped with t2.
+func (h *hub) joinAnswer(r *room, data []byte) {
+	var p struct {
+		To    string          `json:"to"`
+		State json.RawMessage `json:"state"`
+	}
+	if json.Unmarshal(data, &p) != nil || p.To == "" {
+		return
+	}
+	h.mu.Lock()
+	if h.rooms[r.code] != r {
+		h.mu.Unlock()
+		return
+	}
+	pj := r.joins[p.To]
+	delete(r.joins, p.To)
+	queue := r.queue
+	h.mu.Unlock()
+	if pj == nil {
+		return
+	}
+	if pj.timer != nil {
+		pj.timer.Stop()
+	}
+	_ = pj.c.send(buildSnapshot(pj.t1, time.Now().UnixMilli(), queue, p.State))
+}
+
+// expireJoin answers a join the host never answered, so a silent host can never
+// leave a newcomer waiting.
+func (h *hub) expireJoin(r *room, id string) {
+	h.mu.Lock()
+	if h.rooms[r.code] != r {
+		h.mu.Unlock()
+		return
+	}
+	pj := r.joins[id]
+	delete(r.joins, id)
+	queue := r.queue
+	state := r.state
+	h.mu.Unlock()
+	if pj != nil {
+		_ = pj.c.send(buildSnapshot(pj.t1, time.Now().UnixMilli(), queue, state))
+	}
+}
+
+// flushJoinsLocked answers every waiting joiner from the current snapshot and
+// clears them. The caller holds h.mu and sends the returned frames after
+// unlocking.
+func (h *hub) flushJoinsLocked(r *room) []outbound {
+	if len(r.joins) == 0 {
+		return nil
+	}
+	now := time.Now().UnixMilli()
+	out := make([]outbound, 0, len(r.joins))
+	for id, pj := range r.joins {
+		if pj.timer != nil {
+			pj.timer.Stop()
+		}
+		out = append(out, outbound{pj.c, buildSnapshot(pj.t1, now, r.queue, r.state)})
+		delete(r.joins, id)
+	}
+	return out
 }
 
 func (h *hub) sendAll(targets []*client, msg []byte) {
 	for _, t := range targets {
 		_ = t.send(msg)
+	}
+}
+
+func (h *hub) sendOut(out []outbound) {
+	for _, o := range out {
+		_ = o.c.send(o.msg)
 	}
 }
 
@@ -340,6 +488,12 @@ func (h *hub) endRoom(r *room) {
 	for g := range r.guests {
 		orphans = append(orphans, g)
 	}
+	for _, pj := range r.joins {
+		if pj.timer != nil {
+			pj.timer.Stop()
+		}
+	}
+	r.joins = make(map[string]*pendingJoin)
 	h.mu.Unlock()
 
 	msg, _ := json.Marshal(map[string]any{"t": "error", "reason": "host left"})
@@ -386,10 +540,12 @@ func (h *hub) sendMembers(r *room) {
 	}
 }
 
-// remember updates the late-joiner snapshot and returns the frame to forward.
-// The relay is the room clock: it stamps `at` on every state so clients only need
-// their own offset, and it keeps the frame verbatim otherwise. A state is dropped
-// while a round is in flight, since the pending next state is promoted on release.
+// remember updates the room snapshot and returns the frame to forward. The relay
+// is the room clock: it stamps `at` on every state so clients only need their own
+// offset. A queue is shared by every member and forwarded; a state is the host's
+// playback feed, cached for the join fallback and never broadcast (members follow
+// the round and the join snapshot instead). A state is dropped while a round is
+// in flight, since the pending next state is promoted on release.
 func (h *hub) remember(r *room, typ string, data []byte) []byte {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -398,8 +554,14 @@ func (h *hub) remember(r *room, typ string, data []byte) []byte {
 	}
 	switch typ {
 	case "queue":
-		r.queue = append([]byte(nil), data...)
-		return r.queue
+		var m struct {
+			Data string `json:"data"`
+		}
+		if json.Unmarshal(data, &m) != nil {
+			return nil
+		}
+		r.queue = m.Data
+		return data
 	case "state":
 		if r.pending != nil {
 			return nil
@@ -414,28 +576,33 @@ func (h *hub) remember(r *room, typ string, data []byte) []byte {
 			return nil
 		}
 		r.state = b
-		return b
+		return nil
 	}
 	return nil
 }
 
-func (h *hub) replay(r *room, c *client) {
-	h.mu.Lock()
-	if h.rooms[r.code] != r {
-		h.mu.Unlock()
-		return
-	}
-	queue := r.queue
-	state := r.state
-	pending := r.pending != nil
-	h.mu.Unlock()
+func joinForward(t0, t1 int64, from string) []byte {
+	b, _ := json.Marshal(map[string]any{
+		"t":    "join",
+		"at":   t0,
+		"t1":   t1,
+		"from": from,
+	})
+	return b
+}
 
-	if queue != nil {
-		_ = c.send(queue)
+func buildSnapshot(t1, t2 int64, queue string, state []byte) []byte {
+	m := map[string]any{
+		"t":    "snapshot",
+		"echo": t1,
+		"at":   t2,
 	}
-	// While a round is in flight the cached state is the previous track: sending
-	// it would start the newcomer on the wrong song, so it waits for the release.
-	if state != nil && !pending {
-		_ = c.send(state)
+	if queue != "" {
+		m["queue"] = json.RawMessage(queue)
 	}
+	if len(state) > 0 {
+		m["state"] = json.RawMessage(state)
+	}
+	b, _ := json.Marshal(m)
+	return b
 }

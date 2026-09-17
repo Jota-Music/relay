@@ -84,7 +84,6 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		_ = c.send(msg)
 	}
 	h.sendMembers(rm)
-	h.replay(rm, c)
 	h.readLoop(c, rm)
 }
 

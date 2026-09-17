@@ -97,7 +97,7 @@ func send(t *testing.T, c *websocket.Conn, msg string) {
 	}
 }
 
-func TestMembersSnapshotAndRelay(t *testing.T) {
+func TestMembersBroadcast(t *testing.T) {
 	srv := newTestServer(t)
 
 	host := dial(t, srv.URL, "party", roleHost)
@@ -113,23 +113,8 @@ func TestMembersSnapshotAndRelay(t *testing.T) {
 		t.Fatalf("host update = %v", m)
 	}
 
-	send(t, host, `{"t":"state","at":1000,"songId":"abc"}`)
-	if m := read(t, guest); m["t"] != "state" || m["songId"] != "abc" {
-		t.Fatalf("relayed state = %v", m)
-	} else if at, ok := m["at"].(float64); !ok || at < 1e12 {
-		t.Fatalf("forwarded state not relay-stamped: %v", m["at"])
-	}
-
-	late := dial(t, srv.URL, "party", roleGuest)
-	if m := read(t, late); m["t"] != "members" || m["count"].(float64) != 3 {
-		t.Fatalf("late members = %v", m)
-	}
-	if m := read(t, late); m["t"] != "state" || m["songId"] != "abc" {
-		t.Fatalf("late snapshot = %v", m)
-	}
-
-	send(t, late, `{"t":"ping","id":7,"at":123}`)
-	if m := read(t, late); m["t"] != "pong" || m["id"].(float64) != 7 || m["echo"].(float64) == 0 {
+	send(t, guest, `{"t":"ping","id":7,"at":123}`)
+	if m := read(t, guest); m["t"] != "pong" || m["id"].(float64) != 7 || m["echo"].(float64) == 0 {
 		t.Fatalf("pong = %v", m)
 	}
 }
@@ -222,6 +207,266 @@ func TestRoomPassword(t *testing.T) {
 	}
 }
 
+// Every member publishes: the queue and the round are no longer host-only.
+func TestAnyMemberCanPublish(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "free", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "free", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, guest, `{"t":"queue","data":"[]"}`)
+	if m := read(t, host); m["t"] != "queue" || m["data"] != "[]" {
+		t.Fatalf("relayed queue = %v", m)
+	}
+
+	send(t, guest, `{"t":"prepare","gen":"g1","song":{"id":"s1"}}`)
+	if m := read(t, host); m["t"] != "prepare" || m["gen"] != "g1" {
+		t.Fatalf("relayed prepare = %v", m)
+	}
+}
+
+// A join with no host to ask (the joiner is the host) is answered from the cache,
+// with both relay timestamps so the client can compute its offset.
+func TestJoinFromHostUsesCache(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "cache", roleHost)
+	read(t, host)
+
+	send(t, host, `{"t":"state","rev":1,"at":1,"playing":true,"positionMs":5000,"songId":"s1","index":0}`)
+	time.Sleep(50 * time.Millisecond)
+
+	send(t, host, `{"t":"join","at":1000}`)
+	m := read(t, host)
+	if m["t"] != "snapshot" {
+		t.Fatalf("join reply = %v", m)
+	}
+	if m["echo"].(float64) < 1e12 || m["at"].(float64) < m["echo"].(float64) {
+		t.Fatalf("join stamps = %v", m)
+	}
+	state, ok := m["state"].(map[string]any)
+	if !ok || state["songId"] != "s1" {
+		t.Fatalf("join state = %v", m)
+	}
+}
+
+// A join is forwarded to the host, which answers with its live playback; the
+// relay routes only to that joiner and stamps the outgoing time.
+func TestJoinRoutesToHost(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "route", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "route", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, guest, `{"t":"join","at":1000}`)
+	req := read(t, host)
+	if req["t"] != "join" || req["at"].(float64) != 1000 {
+		t.Fatalf("forwarded join = %v", req)
+	}
+	if t1, ok := req["t1"].(float64); !ok || t1 < 1e12 {
+		t.Fatalf("join t1 not relay-stamped: %v", req["t1"])
+	}
+	from, ok := req["from"].(string)
+	if !ok || from == "" {
+		t.Fatalf("join from = %v", req["from"])
+	}
+
+	send(t, host, `{"t":"snapshot","to":"`+from+`","state":{"songId":"s1","playing":true}}`)
+	m := read(t, guest)
+	if m["t"] != "snapshot" {
+		t.Fatalf("snapshot = %v", m)
+	}
+	if m["echo"].(float64) != req["t1"].(float64) {
+		t.Fatalf("snapshot echo %v != t1 %v", m["echo"], req["t1"])
+	}
+	if m["at"].(float64) < 1e12 {
+		t.Fatalf("snapshot not relay-stamped: %v", m["at"])
+	}
+	if state, ok := m["state"].(map[string]any); !ok || state["songId"] != "s1" {
+		t.Fatalf("snapshot state = %v", m)
+	}
+}
+
+// A silent host must not leave a newcomer hanging: the relay answers from the
+// cache after the join timeout.
+func TestJoinFallsBackWhenHostSilent(t *testing.T) {
+	h, srv := newTestHub(t, 8, time.Minute)
+	h.joinTimeout = 50 * time.Millisecond
+
+	host := dial(t, srv.URL, "silent", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "silent", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, guest, `{"t":"join","at":1000}`)
+	read(t, host) // forwarded request, no answer
+
+	if m, ok := readWithin(t, guest, 2*time.Second); !ok || m["t"] != "snapshot" {
+		t.Fatalf("join fallback = %v", m)
+	}
+}
+
+// A join arriving while a round is in flight waits for the release and lands on
+// the promoted track, not the one being replaced.
+func TestJoinDuringRoundGetsPromotedTrack(t *testing.T) {
+	h, srv := newTestHub(t, 8, time.Minute)
+	h.joinTimeout = 50 * time.Millisecond
+
+	host := dial(t, srv.URL, "defer", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "defer", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, host, `{"t":"prepare","gen":"g1","songId":"s2","song":{"id":"s2"}}`)
+	read(t, guest)
+
+	late := dial(t, srv.URL, "defer", roleGuest)
+	if m := read(t, late); m["t"] != "members" || m["count"].(float64) != 3 {
+		t.Fatalf("late members = %v", m)
+	}
+	send(t, late, `{"t":"join","at":1000}`)
+
+	send(t, host, `{"t":"ready","gen":"g1"}`)
+	send(t, guest, `{"t":"ready","gen":"g1"}`)
+
+	// The round releases to the whole room, late joiner included.
+	if m := read(t, late); m["t"] != "play" {
+		t.Fatalf("late play = %v", m)
+	}
+	m := read(t, late)
+	if m["t"] != "snapshot" {
+		t.Fatalf("deferred snapshot = %v", m)
+	}
+	state, ok := m["state"].(map[string]any)
+	if !ok || state["songId"] != "s2" {
+		t.Fatalf("deferred snapshot state = %v", m)
+	}
+}
+
+// A second prepare while a round is open is refused and not forwarded, so a
+// simultaneous track change cannot fork the room.
+func TestConcurrentPrepareKeepsFirstRound(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "race", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "race", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, host, `{"t":"prepare","gen":"g1","song":{"id":"s1"}}`)
+	if m := read(t, guest); m["t"] != "prepare" || m["gen"] != "g1" {
+		t.Fatalf("first prepare = %v", m)
+	}
+
+	send(t, guest, `{"t":"prepare","gen":"g2","song":{"id":"s2"}}`)
+	send(t, host, `{"t":"ready","gen":"g1"}`)
+	send(t, guest, `{"t":"ready","gen":"g1"}`)
+
+	// If the refused prepare had been forwarded, the host would read it before
+	// the release instead of the play for the round it accepted.
+	if m := read(t, host); m["t"] != "play" || m["gen"] != "g1" {
+		t.Fatalf("host play = %v", m)
+	}
+	if m := read(t, guest); m["t"] != "play" || m["gen"] != "g1" {
+		t.Fatalf("guest play = %v", m)
+	}
+}
+
+// The sender never receives its own frame back, so it cannot double-apply it.
+func TestControlNotEchoedToSender(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "echo", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "echo", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, guest, `{"t":"control","action":"toggle"}`)
+	if m := read(t, host); m["t"] != "control" || m["action"] != "toggle" {
+		t.Fatalf("relayed control = %v", m)
+	}
+	if m, ok := readWithin(t, guest, 200*time.Millisecond); ok {
+		t.Fatalf("control echoed to sender: %v", m)
+	}
+}
+
+func TestQueueForwardedOnce(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "once", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "once", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, guest, `{"t":"queue","data":"[1,2,3]"}`)
+	if m := read(t, host); m["t"] != "queue" {
+		t.Fatalf("relayed queue = %v", m)
+	}
+	if m, ok := readWithin(t, guest, 200*time.Millisecond); ok {
+		t.Fatalf("queue echoed to sender: %v", m)
+	}
+}
+
+// A member that leaves mid-round still releases it for the rest.
+func TestInitiatorLeavesMidRoundReleases(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "drop", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "drop", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, guest, `{"t":"prepare","gen":"g1","song":{"id":"s1"}}`)
+	if m := read(t, host); m["t"] != "prepare" {
+		t.Fatalf("prepare = %v", m)
+	}
+
+	guest.Close(websocket.StatusNormalClosure, "")
+	if m := read(t, host); m["t"] != "members" || m["count"].(float64) != 1 {
+		t.Fatalf("members after leave = %v", m)
+	}
+
+	send(t, host, `{"t":"ready","gen":"g1"}`)
+	if m := read(t, host); m["t"] != "play" || m["gen"] != "g1" {
+		t.Fatalf("play after initiator left = %v", m)
+	}
+}
+
+// A host that leaves must not strand a pending join: it is flushed from the cache.
+func TestHostLeftFlushesPendingJoin(t *testing.T) {
+	_, srv := newTestHub(t, 8, time.Minute)
+
+	host := dial(t, srv.URL, "flush", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "flush", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, guest, `{"t":"join","at":1000}`)
+	read(t, host) // forwarded request, no answer
+
+	host.Close(websocket.StatusNormalClosure, "")
+
+	if m := read(t, guest); m["t"] != "snapshot" {
+		t.Fatalf("flushed join = %v", m)
+	}
+	if m := read(t, guest); m["t"] != "members" {
+		t.Fatalf("members after host left = %v", m)
+	}
+}
+
 func TestConsensusPlay(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -291,23 +536,6 @@ func TestMembersCarriesEpoch(t *testing.T) {
 	}
 }
 
-func TestGuestCannotPublish(t *testing.T) {
-	srv := newTestServer(t)
-
-	host := dial(t, srv.URL, "ro", roleHost)
-	read(t, host)
-	guest := dial(t, srv.URL, "ro", roleGuest)
-	read(t, guest)
-	read(t, host)
-
-	// A guest must not be able to inject playback state.
-	send(t, guest, `{"t":"state","at":1,"songId":"hack"}`)
-	send(t, guest, `{"t":"prepare","gen":"hack"}`)
-	if m, ok := readWithin(t, host, 300*time.Millisecond); ok {
-		t.Fatalf("guest message was forwarded: %v", m)
-	}
-}
-
 func TestConsensusReadyFailureStillReleases(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -367,10 +595,11 @@ func TestPlaySchedulesSharedStart(t *testing.T) {
 	}
 }
 
-// A late joiner after a release must land on the new track, not the previous
-// snapshot: the relay promotes the pending prepare into the cached state.
+// After a release the cached state carries the new track, so a joiner answered
+// from the cache lands on it.
 func TestReleasePromotesSnapshot(t *testing.T) {
-	srv := newTestServer(t)
+	h, srv := newTestHub(t, 8, time.Minute)
+	h.joinTimeout = 50 * time.Millisecond
 
 	host := dial(t, srv.URL, "promote", roleHost)
 	read(t, host)
@@ -389,15 +618,44 @@ func TestReleasePromotesSnapshot(t *testing.T) {
 	if m := read(t, late); m["t"] != "members" {
 		t.Fatalf("late members = %v", m)
 	}
+	send(t, late, `{"t":"join","at":1000}`)
+	// The host does not answer: the relay falls back to the promoted cache.
 	m := read(t, late)
-	if m["t"] != "state" || m["songId"] != "s2" {
+	if m["t"] != "snapshot" {
 		t.Fatalf("promoted snapshot = %v", m)
 	}
-	if m["index"].(float64) != 3 || m["playing"] != true || m["positionMs"].(float64) != 0 {
-		t.Fatalf("promoted snapshot fields = %v", m)
+	state, ok := m["state"].(map[string]any)
+	if !ok {
+		t.Fatalf("promoted state missing: %v", m)
 	}
-	if m["at"] != play["at"] {
-		t.Fatalf("promoted at %v != play at %v", m["at"], play["at"])
+	if state["songId"] != "s2" || state["positionMs"].(float64) != 0 || state["playing"] != true {
+		t.Fatalf("promoted state fields = %v", state)
+	}
+	if state["at"] != play["at"] {
+		t.Fatalf("promoted at %v != play at %v", state["at"], play["at"])
+	}
+}
+
+// The cached state carries the whole track so a joiner can load it without
+// depending on its own queue.
+func TestSnapshotKeepsTrack(t *testing.T) {
+	srv := newTestServer(t)
+
+	host := dial(t, srv.URL, "track", roleHost)
+	read(t, host)
+
+	send(t, host, `{"t":"state","seq":1,"at":1,"playing":true,"positionMs":0,"songId":"s1","index":0,"song":{"id":"s1","name":"Track"}}`)
+	time.Sleep(50 * time.Millisecond)
+
+	send(t, host, `{"t":"join","at":1000}`)
+	m := read(t, host)
+	state, ok := m["state"].(map[string]any)
+	if !ok || state["songId"] != "s1" {
+		t.Fatalf("snapshot state = %v", m)
+	}
+	song, ok := state["song"].(map[string]any)
+	if !ok || song["id"] != "s1" {
+		t.Fatalf("snapshot dropped the track: %v", state)
 	}
 }
 
@@ -462,54 +720,6 @@ func TestHostLeftEndsRoom(t *testing.T) {
 	}
 	if m := read(t, guest); m["t"] != "error" {
 		t.Fatalf("expected host-left error, got %v", m)
-	}
-}
-
-func TestSnapshotStampsRelayClock(t *testing.T) {
-	srv := newTestServer(t)
-
-	host := dial(t, srv.URL, "snap", roleHost)
-	read(t, host)
-
-	send(t, host, `{"t":"state","rev":1,"at":1,"playing":true,"positionMs":5000,"songId":"s1","index":0}`)
-	time.Sleep(50 * time.Millisecond)
-
-	late := dial(t, srv.URL, "snap", roleGuest)
-	if m := read(t, late); m["t"] != "members" {
-		t.Fatalf("late members = %v", m)
-	}
-	m := read(t, late)
-	if m["t"] != "state" || m["songId"] != "s1" {
-		t.Fatalf("late snapshot = %v", m)
-	}
-	if at, ok := m["at"].(float64); !ok || at < 1e12 {
-		t.Fatalf("snapshot at not stamped by the relay: %v", m["at"])
-	}
-}
-
-// The cached state carries the whole track so a late joiner (or a guest that
-// missed the prepare) can load it without depending on its own queue. The relay
-// re-marshals state to re-stamp `at`, so this guards the nested payload survives.
-func TestSnapshotKeepsTrack(t *testing.T) {
-	srv := newTestServer(t)
-
-	host := dial(t, srv.URL, "track", roleHost)
-	read(t, host)
-
-	send(t, host, `{"t":"state","seq":1,"at":1,"playing":true,"positionMs":0,"songId":"s1","index":0,"song":{"id":"s1","name":"Track"}}`)
-	time.Sleep(50 * time.Millisecond)
-
-	late := dial(t, srv.URL, "track", roleGuest)
-	if m := read(t, late); m["t"] != "members" {
-		t.Fatalf("late members = %v", m)
-	}
-	m := read(t, late)
-	if m["t"] != "state" || m["songId"] != "s1" {
-		t.Fatalf("late snapshot = %v", m)
-	}
-	song, ok := m["song"].(map[string]any)
-	if !ok || song["id"] != "s1" {
-		t.Fatalf("snapshot dropped the track: %v", m)
 	}
 }
 

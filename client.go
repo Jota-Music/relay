@@ -28,6 +28,7 @@ var (
 // client owns one websocket and a writer goroutine, so a room broadcast never
 // blocks on a slow peer.
 type client struct {
+	id       string
 	conn     *websocket.Conn
 	role     string
 	room     *room
@@ -40,6 +41,7 @@ type client struct {
 
 func newClient(conn *websocket.Conn, role string) *client {
 	c := &client{
+		id:   newID(),
 		conn: conn,
 		role: role,
 		out:  make(chan []byte, sendBuffer),
@@ -179,20 +181,36 @@ func (h *hub) readLoop(c *client, r *room) {
 			_ = json.Unmarshal(data, &p)
 			h.markReady(c, r, p.Gen, p.OK == nil || *p.OK)
 			continue
-		case "prepare":
+		case "join":
+			var p struct {
+				At int64 `json:"at"`
+			}
+			_ = json.Unmarshal(data, &p)
+			h.joinRequest(r, c, p.At)
+			continue
+		case "snapshot":
 			if c.role != roleHost {
 				continue
 			}
+			h.joinAnswer(r, data)
+			continue
+		case "prepare":
+			// Any member may announce the next track. A round already in flight
+			// refuses the new one, and the refused prepare is not forwarded.
 			var p struct {
 				Gen string `json:"gen"`
 			}
 			_ = json.Unmarshal(data, &p)
-			h.startRound(r, p.Gen, data)
-		case "state", "queue":
-			if c.role != roleHost {
+			if !h.startRound(r, p.Gen, data) {
 				continue
 			}
-			// Forward the relay-stamped frame, not the host's local clock.
+		case "state", "queue":
+			// Only the host feeds the playback cache; the shared queue comes from
+			// any member.
+			if c.role != roleHost && head.T == "state" {
+				continue
+			}
+			// Forward the relay-stamped frame, not the sender's local clock.
 			out := h.remember(r, head.T, data)
 			if out == nil {
 				continue
