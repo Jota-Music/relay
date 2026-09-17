@@ -392,6 +392,140 @@ func TestJoinFallbackDefersWhileRoundPending(t *testing.T) {
 	}
 }
 
+// A host that drops and comes back must sync to the room it left behind, not
+// reset it: the snapshot (queue and paused playback) survives the reclaim.
+func TestHostReclaimKeepsSnapshot(t *testing.T) {
+	_, srv := newTestHub(t, 8, time.Minute)
+
+	host := dial(t, srv.URL, "keep", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "keep", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, host, `{"t":"queue","data":"[{\"id\":\"s1\"}]"}`)
+	if m := read(t, guest); m["t"] != "queue" {
+		t.Fatalf("relayed queue = %v", m)
+	}
+	send(t, host, `{"t":"state","playing":false,"positionMs":5000,"songId":"s1","index":0}`)
+	time.Sleep(50 * time.Millisecond)
+
+	host.Close(websocket.StatusNormalClosure, "")
+	if m := read(t, guest); m["t"] != "members" || m["count"].(float64) != 1 {
+		t.Fatalf("guest members after host left = %v", m)
+	}
+
+	again := dial(t, srv.URL, "keep", roleHost)
+	if m := read(t, again); m["t"] != "members" || m["count"].(float64) != 2 {
+		t.Fatalf("reclaim members = %v", m)
+	}
+	send(t, again, `{"t":"join","at":1000}`)
+	m := read(t, again)
+	if m["t"] != "snapshot" {
+		t.Fatalf("reclaim snapshot = %v", m)
+	}
+	state, ok := m["state"].(map[string]any)
+	if !ok || state["songId"] != "s1" || state["playing"] != false ||
+		state["positionMs"].(float64) != 5000 {
+		t.Fatalf("reclaim lost the paused state: %v", m)
+	}
+	if q, ok := m["queue"].([]any); !ok || len(q) != 1 {
+		t.Fatalf("reclaim lost the queue: %v", m)
+	}
+}
+
+// A room keeps its snapshot for ROOM_TTL after the last member leaves, so a
+// rejoin inside the window syncs instead of starting a fresh room.
+func TestEmptyRoomSurvivesForRejoin(t *testing.T) {
+	h, srv := newTestHub(t, 8, time.Minute)
+
+	host := dial(t, srv.URL, "survive", roleHost)
+	read(t, host)
+	send(t, host, `{"t":"state","playing":true,"positionMs":1000,"songId":"s9","index":0}`)
+	time.Sleep(50 * time.Millisecond)
+	host.Close(websocket.StatusNormalClosure, "")
+
+	// The leave is processed asynchronously: wait for the room to empty.
+	for i := 0; i < 200; i++ {
+		h.mu.Lock()
+		r := h.rooms["survive"]
+		empty := r != nil && r.host == nil && len(r.guests) == 0
+		h.mu.Unlock()
+		if empty {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	again := dial(t, srv.URL, "survive", roleHost)
+	read(t, again)
+	send(t, again, `{"t":"join","at":1000}`)
+	m := read(t, again)
+	if m["t"] != "snapshot" {
+		t.Fatalf("rejoin snapshot = %v", m)
+	}
+	state, ok := m["state"].(map[string]any)
+	if !ok || state["songId"] != "s9" {
+		t.Fatalf("empty room lost its snapshot: %v", m)
+	}
+}
+
+// Joining a paused room brings the current track paused at its position.
+func TestJoinGetsPausedSnapshot(t *testing.T) {
+	h, srv := newTestHub(t, 8, time.Minute)
+	h.joinTimeout = 50 * time.Millisecond
+
+	host := dial(t, srv.URL, "paused", roleHost)
+	read(t, host)
+	send(t, host, `{"t":"state","playing":false,"positionMs":42000,"songId":"s1","index":2}`)
+	time.Sleep(50 * time.Millisecond)
+
+	guest := dial(t, srv.URL, "paused", roleGuest)
+	read(t, guest)
+	read(t, host)
+	send(t, guest, `{"t":"join","at":1000}`)
+	read(t, host) // forwarded; the host stays silent and the cache answers
+
+	m := read(t, guest)
+	if m["t"] != "snapshot" {
+		t.Fatalf("paused snapshot = %v", m)
+	}
+	state, ok := m["state"].(map[string]any)
+	if !ok || state["playing"] != false || state["positionMs"].(float64) != 42000 {
+		t.Fatalf("paused state = %v", m)
+	}
+}
+
+// Any member feeds the playback cache, so a guest's pause reaches a joiner that
+// is answered from the cache while the host stays silent.
+func TestAnyMemberFeedsState(t *testing.T) {
+	h, srv := newTestHub(t, 8, time.Minute)
+	h.joinTimeout = 50 * time.Millisecond
+
+	host := dial(t, srv.URL, "feed", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "feed", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	// The guest, not the host, sets the room state.
+	send(t, guest, `{"t":"state","playing":false,"positionMs":7000,"songId":"sg","index":1}`)
+	time.Sleep(50 * time.Millisecond)
+
+	late := dial(t, srv.URL, "feed", roleGuest)
+	read(t, late)
+	read(t, host)
+	read(t, guest)
+	send(t, late, `{"t":"join","at":1000}`)
+	read(t, host) // forwarded; the host stays silent and the cache answers
+
+	m := read(t, late)
+	state, ok := m["state"].(map[string]any)
+	if !ok || state["songId"] != "sg" {
+		t.Fatalf("guest state not in the cache: %v", m)
+	}
+}
+
 // A second prepare while a round is open is refused and not forwarded, so a
 // simultaneous track change cannot fork the room.
 func TestConcurrentPrepareKeepsFirstRound(t *testing.T) {

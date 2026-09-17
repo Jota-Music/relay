@@ -205,12 +205,9 @@ func (h *hub) readLoop(c *client, r *room) {
 				continue
 			}
 		case "state", "queue":
-			// Only the host feeds the playback cache; the shared queue comes from
-			// any member.
-			if c.role != roleHost && head.T == "state" {
-				continue
-			}
-			// Forward the relay-stamped frame, not the sender's local clock.
+			// Any member feeds the shared queue and the playback cache, so the
+			// room snapshot stays fresh even while the host is away. Forward the
+			// relay-stamped frame, not the sender's local clock.
 			out := h.remember(r, head.T, data)
 			if out == nil {
 				continue

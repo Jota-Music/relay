@@ -202,12 +202,9 @@ func (h *hub) join(code, role, pass string, c *client) (*room, string, error) {
 		}
 		r.host = c
 		r.epoch = newEpoch()
-		// The snapshot and any in-flight round belonged to the previous host
-		// session: drop them so a late joiner cannot apply stale playback under
-		// the new epoch.
-		r.queue = ""
-		r.state = nil
-		r.pending = nil
+		// The snapshot is the room's, not the host's: keep it so a member that
+		// rejoins (the host included) syncs to the state the room still holds,
+		// rather than resetting the room to whoever reconnected.
 		if r.timer != nil {
 			r.timer.Stop()
 			r.timer = nil
@@ -260,15 +257,12 @@ func (h *hub) leave(c *client) *room {
 		targets = r.all()
 	}
 
-	if r.host == nil && len(r.guests) == 0 {
-		delete(h.rooms, r.code)
-		h.mu.Unlock()
-	} else {
-		if r.host == nil && r.timer == nil {
-			r.timer = time.AfterFunc(h.ttl, func() { h.endRoom(r) })
-		}
-		h.mu.Unlock()
+	// An empty room is kept until the TTL expires instead of being dropped at
+	// once, so a member that steps out and rejoins still syncs to the snapshot.
+	if r.host == nil && r.timer == nil {
+		r.timer = time.AfterFunc(h.ttl, func() { h.endRoom(r) })
 	}
+	h.mu.Unlock()
 
 	if play != nil {
 		h.sendAll(targets, play)
