@@ -67,7 +67,7 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	conn.SetReadLimit(maxMessageBytes)
 
-	c := newClient(conn, role)
+	c := newClient(conn)
 	rm, assigned, err := h.join(code, role, pass, c)
 	if err != nil {
 		msg, _ := json.Marshal(map[string]any{"t": "error", "reason": err.Error()})
@@ -81,7 +81,7 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	if role == "" {
 		msg, _ := json.Marshal(map[string]any{"t": "role", "role": assigned})
-		_ = c.send(msg)
+		c.send(msg)
 	}
 	h.sendMembers(rm)
 	h.readLoop(c, rm)

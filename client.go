@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,11 +19,6 @@ const (
 	sendBuffer = 64
 )
 
-var (
-	errClosed       = errors.New("client closed")
-	errSlowConsumer = errors.New("slow consumer")
-)
-
 // client owns one websocket and a writer goroutine, so a room broadcast never
 // blocks on a slow peer.
 type client struct {
@@ -39,11 +33,10 @@ type client struct {
 	inFlight atomic.Int64
 }
 
-func newClient(conn *websocket.Conn, role string) *client {
+func newClient(conn *websocket.Conn) *client {
 	c := &client{
-		id:   newID(),
+		id:   randHex(8),
 		conn: conn,
-		role: role,
 		out:  make(chan []byte, sendBuffer),
 		done: make(chan struct{}),
 	}
@@ -79,23 +72,20 @@ func (c *client) closed() bool {
 
 // send enqueues a frame, never blocking the caller. A full queue means the peer
 // is too slow, so it is dropped.
-func (c *client) send(data []byte) error {
+func (c *client) send(data []byte) {
 	select {
 	case <-c.done:
-		return errClosed
+		return
 	default:
 	}
 	c.inFlight.Add(1)
 	select {
 	case c.out <- data:
-		return nil
 	case <-c.done:
 		c.inFlight.Add(-1)
-		return errClosed
 	default:
 		c.inFlight.Add(-1)
 		c.close()
-		return errSlowConsumer
 	}
 }
 
@@ -170,7 +160,7 @@ func (h *hub) readLoop(c *client, r *room) {
 				"at":   p.At,
 				"echo": time.Now().UnixMilli(),
 			})
-			_ = c.send(pong)
+			c.send(pong)
 			continue
 		case "ready":
 			// Any member answers a round; a missing flag means it loaded.
@@ -219,7 +209,7 @@ func (h *hub) readLoop(c *client, r *room) {
 		targets := r.others(c)
 		h.mu.Unlock()
 		for _, t := range targets {
-			_ = t.send(data)
+			t.send(data)
 		}
 	}
 }

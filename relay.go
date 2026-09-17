@@ -84,23 +84,17 @@ func hashPass(p string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func newEpoch() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
-}
-
-func newID() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
+func randHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 func newRoom(code string) *room {
 	return &room{
 		code:   code,
 		guests: make(map[*client]struct{}),
-		epoch:  newEpoch(),
+		epoch:  randHex(16),
 		joins:  make(map[string]*pendingJoin),
 	}
 }
@@ -115,14 +109,7 @@ func (r *room) members() int {
 
 // all returns every member, host first.
 func (r *room) all() []*client {
-	out := make([]*client, 0, len(r.guests)+1)
-	if r.host != nil {
-		out = append(out, r.host)
-	}
-	for g := range r.guests {
-		out = append(out, g)
-	}
-	return out
+	return r.others(nil)
 }
 
 // others returns every member except of. Pass nil to get all members.
@@ -201,7 +188,7 @@ func (h *hub) join(code, role, pass string, c *client) (*room, string, error) {
 			go old.close()
 		}
 		r.host = c
-		r.epoch = newEpoch()
+		r.epoch = randHex(16)
 		// The snapshot is the room's, not the host's: keep it so a member that
 		// rejoins (the host included) syncs to the state the room still holds,
 		// rather than resetting the room to whoever reconnected.
@@ -381,7 +368,7 @@ func (h *hub) joinRequest(r *room, c *client, t0 int64) {
 		queue := r.queue
 		state := r.state
 		h.mu.Unlock()
-		_ = c.send(buildSnapshot(t1, time.Now().UnixMilli(), queue, state))
+		c.send(buildSnapshot(t1, time.Now().UnixMilli(), queue, state))
 		return
 	}
 	pj := &pendingJoin{c: c, t0: t0, t1: t1}
@@ -395,7 +382,7 @@ func (h *hub) joinRequest(r *room, c *client, t0 int64) {
 	if pending {
 		return
 	}
-	_ = host.send(joinForward(t0, t1, c.id))
+	host.send(joinForward(t0, t1, c.id))
 }
 
 // joinAnswer routes the host's playback to the waiting joiner, stamped with t2.
@@ -422,7 +409,7 @@ func (h *hub) joinAnswer(r *room, data []byte) {
 	if pj.timer != nil {
 		pj.timer.Stop()
 	}
-	_ = pj.c.send(buildSnapshot(pj.t1, time.Now().UnixMilli(), queue, p.State))
+	pj.c.send(buildSnapshot(pj.t1, time.Now().UnixMilli(), queue, p.State))
 }
 
 // expireJoin answers a join the host never answered, so a silent host can never
@@ -453,7 +440,7 @@ func (h *hub) expireJoin(r *room, id string) {
 	queue := r.queue
 	state := r.state
 	h.mu.Unlock()
-	_ = pj.c.send(buildSnapshot(pj.t1, time.Now().UnixMilli(), queue, state))
+	pj.c.send(buildSnapshot(pj.t1, time.Now().UnixMilli(), queue, state))
 }
 
 // flushJoinsLocked answers every waiting joiner from the current snapshot and
@@ -477,13 +464,13 @@ func (h *hub) flushJoinsLocked(r *room) []outbound {
 
 func (h *hub) sendAll(targets []*client, msg []byte) {
 	for _, t := range targets {
-		_ = t.send(msg)
+		t.send(msg)
 	}
 }
 
 func (h *hub) sendOut(out []outbound) {
 	for _, o := range out {
-		_ = o.c.send(o.msg)
+		o.c.send(o.msg)
 	}
 }
 
@@ -509,7 +496,7 @@ func (h *hub) endRoom(r *room) {
 
 	msg, _ := json.Marshal(map[string]any{"t": "error", "reason": "host left"})
 	for _, g := range orphans {
-		_ = g.send(msg)
+		g.send(msg)
 		g.closeAfterFlush(500 * time.Millisecond)
 	}
 }
@@ -542,13 +529,11 @@ func (h *hub) sendMembers(r *room) {
 	}
 	count := r.members()
 	epoch := r.epoch
-	targets := r.others(nil)
+	targets := r.all()
 	h.mu.Unlock()
 
 	msg, _ := json.Marshal(map[string]any{"t": "members", "count": count, "epoch": epoch})
-	for _, c := range targets {
-		_ = c.send(msg)
-	}
+	h.sendAll(targets, msg)
 }
 
 // remember updates the room snapshot and returns the frame to forward. The relay

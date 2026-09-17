@@ -12,7 +12,10 @@ import (
 
 func main() {
 	port := cmp.Or(os.Getenv("PORT"), "8080")
-	maxGuests := getint("MAX_GUESTS", 8)
+	maxGuests := 8
+	if v, err := strconv.Atoi(os.Getenv("MAX_GUESTS")); err == nil {
+		maxGuests = v
+	}
 	// How long a room survives without its host before the jam ends. Long enough
 	// for an automatic reconnect, short enough to not linger.
 	ttl := getdur("ROOM_TTL", 30*time.Second)
@@ -39,13 +42,6 @@ func main() {
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatal(err)
 	}
-}
-
-func getint(key string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
-		return v
-	}
-	return fallback
 }
 
 func getdur(key string, fallback time.Duration) time.Duration {
