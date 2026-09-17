@@ -995,3 +995,74 @@ func TestRoomStatusAuth(t *testing.T) {
 		t.Fatalf("authorized room = %+v", st)
 	}
 }
+
+// A member that keeps pinging but never answers ready must not hold the room
+// open: the round deadline releases it for everyone else.
+func TestRoundDeadlineReleasesWithoutStraggler(t *testing.T) {
+	h, srv := newTestHub(t, 8, time.Minute)
+	h.roundTimeout = 150 * time.Millisecond
+
+	host := dial(t, srv.URL, "deadline", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "deadline", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	send(t, host, `{"t":"prepare","gen":"g1","song":{"id":"s1"}}`)
+	if m := read(t, guest); m["t"] != "prepare" || m["gen"] != "g1" {
+		t.Fatalf("prepare = %v", m)
+	}
+
+	// The straggler stays alive (pings) but never sends ready; only the host does.
+	send(t, guest, `{"t":"ping","id":1,"at":1}`)
+	read(t, guest)
+	send(t, host, `{"t":"ready","gen":"g1"}`)
+
+	if m := read(t, guest); m["t"] != "play" || m["gen"] != "g1" {
+		t.Fatalf("guest play after deadline = %v", m)
+	}
+	if m := read(t, host); m["t"] != "play" || m["gen"] != "g1" {
+		t.Fatalf("host play after deadline = %v", m)
+	}
+}
+
+// A fired room timer must not end a room whose host has reconnected: the room
+// is reclaimed, not orphaned.
+func TestEndRoomSparesReconnectedHost(t *testing.T) {
+	h, srv := newTestHub(t, 8, time.Minute)
+
+	host := dial(t, srv.URL, "spare", roleHost)
+	read(t, host)
+	guest := dial(t, srv.URL, "spare", roleGuest)
+	read(t, guest)
+	read(t, host)
+
+	h.mu.Lock()
+	r := h.rooms["spare"]
+	h.mu.Unlock()
+
+	// Model the TTL timer firing after the host already came back.
+	h.endRoom(r)
+
+	if m, ok := readWithin(t, guest, 200*time.Millisecond); ok {
+		t.Fatalf("room ended with host present: %v", m)
+	}
+	if st := getStatus(t, srv.URL, "spare", ""); !st.Active || !st.HasHost {
+		t.Fatalf("room gone after timer = %+v", st)
+	}
+}
+
+func TestRoomFull(t *testing.T) {
+	_, srv := newTestHub(t, 1, time.Minute)
+
+	host := dial(t, srv.URL, "full", roleHost)
+	read(t, host)
+	first := dial(t, srv.URL, "full", roleGuest)
+	read(t, first)
+	read(t, host)
+
+	second := dial(t, srv.URL, "full", roleGuest)
+	if m := read(t, second); m["t"] != "error" || !strings.Contains(m["reason"].(string), "full") {
+		t.Fatalf("room full = %v", m)
+	}
+}
