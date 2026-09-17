@@ -18,6 +18,10 @@ const (
 
 	defaultLead        = 800 * time.Millisecond
 	defaultJoinTimeout = 1500 * time.Millisecond
+	// defaultRoundTimeout bounds a consensus round: a member that answered the
+	// liveness ping but never sent ready is force-released instead of holding the
+	// room open forever.
+	defaultRoundTimeout = 3 * time.Second
 	// maxJoinDeferrals bounds how many join timeouts a round in flight may push
 	// back before the relay gives up and answers from the cache anyway.
 	maxJoinDeferrals = 8
@@ -28,12 +32,13 @@ const (
 // or not), and the relay releases the round once they all have. It releases on a
 // shared instant so every member starts together instead of on frame arrival.
 // A member that fails to load answers with ok=false so it cannot stall the room;
-// a member that never answers is only removed by the liveness sweep.
+// a member that never answers is dropped by the round deadline.
 type round struct {
 	gen      string
 	next     []byte
 	expected map[*client]bool
 	answers  map[*client]bool
+	timer    *time.Timer
 }
 
 // pendingJoin is a member waiting for the room snapshot. The relay stamps t1 on

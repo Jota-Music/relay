@@ -26,6 +26,7 @@ docker run -e PORT=8080 -p 8080:8080 ghcr.io/jota-music/relay
 | `MAX_GUESTS` | `8` | Max guests per room (host not counted). |
 | `ROOM_TTL` | `30s` | Grace before a room without its host ends the room. |
 | `PLAY_LEAD` | `800ms` | Lead time between releasing a round and the scheduled start. |
+| `ROUND_TIMEOUT` | `3s` | Deadline before a consensus round releases without its stragglers. |
 | `AUTH_TOKEN` | _(empty)_ | Shared secret for `/ws`; empty keeps the relay open. |
 
 **Auth.** With `AUTH_TOKEN` set, clients send `Authorization: Bearer <token>`
@@ -101,8 +102,10 @@ when each frame arrives. A second `prepare` while a round is open is refused and
 not forwarded, so simultaneous track changes resolve to one round. A member
 joining after the `prepare` does not extend the round; a member leaving lowers the
 requirement. A member that cannot load answers `ok=false`, so the room never waits
-on it forever. A member that stops answering is dropped by a liveness sweep
-(`ping` is expected every second), and its departure unblocks the round. A `ready`
+on it forever. A round that runs past `ROUND_TIMEOUT` releases without its
+stragglers, so a member that keeps pinging but never answers cannot stall the room;
+a member that stops answering at all is dropped by the liveness sweep (`ping` is
+expected every second), and its departure also unblocks the round. A `ready`
 for a stale generation is ignored.
 
 **Rooms.** When the host disconnects the room waits `ROOM_TTL` for it to come back;

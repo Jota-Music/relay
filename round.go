@@ -33,7 +33,40 @@ func (h *hub) startRound(r *room, gen string, next []byte) bool {
 		expected: expected,
 		answers:  make(map[*client]bool),
 	}
+	// A member that stops answering ready must not hold the room open: the round
+	// releases on its own after roundTimeout, treating non-answers as failures.
+	if h.roundTimeout > 0 {
+		r.pending.timer = time.AfterFunc(h.roundTimeout, func() { h.expireRound(r, gen) })
+	}
 	return true
+}
+
+// expireRound force-releases a round that ran past its deadline. Members that
+// never answered ready are simply left out, so the room keeps playing instead of
+// waiting on a straggler that is alive but not cooperating.
+func (h *hub) expireRound(r *room, gen string) {
+	h.mu.Lock()
+	if h.rooms[r.code] != r || r.pending == nil || r.pending.gen != gen {
+		h.mu.Unlock()
+		return
+	}
+	// Count the members that never answered as failures so the round releases.
+	for c := range r.pending.expected {
+		if _, ok := r.pending.answers[c]; !ok {
+			r.pending.answers[c] = false
+		}
+	}
+	msg, out := h.finishRoundLocked(r)
+	var targets []*client
+	if msg != nil {
+		targets = r.all()
+	}
+	h.mu.Unlock()
+
+	if msg != nil {
+		h.sendAll(targets, msg)
+	}
+	h.sendOut(out)
 }
 
 // finishRoundLocked releases the pending round once everyone expected has
@@ -47,6 +80,9 @@ func (h *hub) finishRoundLocked(r *room) ([]byte, []outbound) {
 	}
 	if len(p.expected) != 0 && len(p.answers) < len(p.expected) {
 		return nil, nil
+	}
+	if p.timer != nil {
+		p.timer.Stop()
 	}
 	r.pending = nil
 

@@ -9,22 +9,24 @@ import (
 )
 
 type hub struct {
-	mu          sync.Mutex
-	rooms       map[string]*room
-	maxGuests   int
-	ttl         time.Duration
-	lead        time.Duration
-	joinTimeout time.Duration
-	token       string
+	mu           sync.Mutex
+	rooms        map[string]*room
+	maxGuests    int
+	ttl          time.Duration
+	lead         time.Duration
+	joinTimeout  time.Duration
+	roundTimeout time.Duration
+	token        string
 }
 
 func newHub(maxGuests int, ttl time.Duration) *hub {
 	return &hub{
-		rooms:       make(map[string]*room),
-		maxGuests:   maxGuests,
-		ttl:         ttl,
-		lead:        defaultLead,
-		joinTimeout: defaultJoinTimeout,
+		rooms:        make(map[string]*room),
+		maxGuests:    maxGuests,
+		ttl:          ttl,
+		lead:         defaultLead,
+		joinTimeout:  defaultJoinTimeout,
+		roundTimeout: defaultRoundTimeout,
 	}
 }
 

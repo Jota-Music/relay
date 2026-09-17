@@ -22,6 +22,7 @@ func main() {
 
 	h := newHub(maxGuests, ttl)
 	h.lead = getdur("PLAY_LEAD", defaultLead)
+	h.roundTimeout = getdur("ROUND_TIMEOUT", defaultRoundTimeout)
 	h.token = os.Getenv("AUTH_TOKEN")
 
 	go func() {
