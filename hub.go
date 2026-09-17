@@ -213,3 +213,31 @@ func (h *hub) sendMembers(r *room) {
 	msg, _ := json.Marshal(map[string]any{"t": "members", "count": count, "epoch": epoch})
 	h.sendAll(targets, msg)
 }
+
+// roomStatus is the public snapshot of a room: counts and flags only, never the
+// queue or the playback state.
+type roomStatus struct {
+	Active  bool `json:"active"`
+	Members int  `json:"members"`
+	HasHost bool `json:"hasHost"`
+	Locked  bool `json:"locked"`
+}
+
+// status reports the live state of a room by exact code. An unknown code returns
+// the zero value; there is no way to enumerate rooms.
+func (h *hub) status(code string) roomStatus {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	r := h.rooms[code]
+	if r == nil {
+		return roomStatus{}
+	}
+	members := r.members()
+	return roomStatus{
+		Active:  members > 0,
+		Members: members,
+		HasHost: r.host != nil,
+		Locked:  r.passHash != "",
+	}
+}

@@ -16,7 +16,7 @@ func main() {
 	if v, err := strconv.Atoi(os.Getenv("MAX_GUESTS")); err == nil {
 		maxGuests = v
 	}
-	// How long a room survives without its host before the jam ends. Long enough
+	// How long a room survives without its host before the room ends. Long enough
 	// for an automatic reconnect, short enough to not linger.
 	ttl := getdur("ROOM_TTL", 30*time.Second)
 
@@ -33,6 +33,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", h.handleWS)
+	mux.HandleFunc("GET /rooms/{code}", h.handleRoomStatus)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]bool{"auth": h.token != ""})

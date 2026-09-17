@@ -37,6 +37,12 @@ whether a token is required.
 `X-Room-Password` (or `?pass=`) or the connection closes. An empty password
 leaves the room open.
 
+**Room status.** `GET /rooms/{code}` returns
+`{"active":bool,"members":N,"hasHost":bool,"locked":bool}` for a room the caller
+already knows the code of; an unknown code returns `{"active":false}`. It is
+read-only, never lists rooms and exposes no queue or playback. With `AUTH_TOKEN`
+set, the request must carry the same `Authorization: Bearer` header as `/ws`.
+
 Host it behind TLS (Caddy/nginx) and point the app at `wss://` or `https://`
 (the `/ws` path is added automatically); `ws://`/`http://` works for local
 testing.

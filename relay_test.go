@@ -23,6 +23,7 @@ func newTestHub(t *testing.T, maxGuests int, ttl time.Duration) (*hub, *httptest
 	h := newHub(maxGuests, ttl)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", h.handleWS)
+	mux.HandleFunc("GET /rooms/{code}", h.handleRoomStatus)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return h, srv
@@ -911,5 +912,86 @@ func TestLargeMessageRelayed(t *testing.T) {
 	send(t, host, big)
 	if m := read(t, guest); m["t"] != "queue" {
 		t.Fatalf("relayed = %v", m)
+	}
+}
+
+func getStatus(t *testing.T, base, code, token string) roomStatus {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, base+"/rooms/"+code, nil)
+	if err != nil {
+		t.Fatalf("status request: %v", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status code = %d", resp.StatusCode)
+	}
+	var st roomStatus
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		t.Fatalf("status decode: %v", err)
+	}
+	return st
+}
+
+func TestRoomStatus(t *testing.T) {
+	_, srv := newTestHub(t, 8, time.Minute)
+
+	if st := getStatus(t, srv.URL, "nope", ""); st.Active || st.Members != 0 {
+		t.Fatalf("unknown room = %+v", st)
+	}
+
+	host := dial(t, srv.URL, "party", roleHost)
+	defer host.Close(websocket.StatusNormalClosure, "")
+	read(t, host)
+
+	if st := getStatus(t, srv.URL, "party", ""); !st.Active || !st.HasHost || st.Members != 1 || st.Locked {
+		t.Fatalf("host room = %+v", st)
+	}
+
+	guest := dial(t, srv.URL, "party", roleGuest)
+	defer guest.Close(websocket.StatusNormalClosure, "")
+	read(t, guest)
+
+	if st := getStatus(t, srv.URL, "party", ""); st.Members != 2 || !st.HasHost {
+		t.Fatalf("guest room = %+v", st)
+	}
+}
+
+func TestRoomStatusLocked(t *testing.T) {
+	_, srv := newTestHub(t, 8, time.Minute)
+
+	host, _, err := dialPass(t, srv.URL, "secret", roleHost, "pw")
+	if err != nil {
+		t.Fatalf("host dial: %v", err)
+	}
+	defer host.Close(websocket.StatusNormalClosure, "")
+	read(t, host)
+
+	if st := getStatus(t, srv.URL, "secret", ""); !st.Locked {
+		t.Fatalf("locked room = %+v", st)
+	}
+}
+
+func TestRoomStatusAuth(t *testing.T) {
+	h, srv := newTestHub(t, 8, time.Minute)
+	h.token = "sesame"
+
+	resp, err := http.Get(srv.URL + "/rooms/party")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without token, got %d", resp.StatusCode)
+	}
+
+	if st := getStatus(t, srv.URL, "party", "sesame"); st.Active {
+		t.Fatalf("authorized room = %+v", st)
 	}
 }

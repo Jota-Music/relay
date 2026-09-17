@@ -87,6 +87,24 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	h.readLoop(c, rm)
 }
 
+// handleRoomStatus reports whether a room is live and how many members it has.
+// It never lists rooms and exposes no contents: the caller must already know the
+// code, which is the room's shared secret. Auth mirrors /ws so a relay behind a
+// token stays locked down.
+func (h *hub) handleRoomStatus(w http.ResponseWriter, r *http.Request) {
+	if !h.authorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	code := r.PathValue("code")
+	if !validCode(code) {
+		http.Error(w, "invalid room", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(h.status(code))
+}
+
 func validCode(code string) bool {
 	if len(code) == 0 || len(code) > maxCodeLen {
 		return false
