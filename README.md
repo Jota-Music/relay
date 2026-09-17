@@ -24,7 +24,7 @@ docker run -e PORT=8080 -p 8080:8080 ghcr.io/jota-music/relay
 |----------|---------|-------------|
 | `PORT` | `8080` | HTTP listen port. |
 | `MAX_GUESTS` | `8` | Max guests per room (host not counted). |
-| `ROOM_TTL` | `30s` | Grace before a room without its host ends the jam. |
+| `ROOM_TTL` | `30s` | Grace before a room without its host ends the room. |
 | `PLAY_LEAD` | `800ms` | Lead time between releasing a round and the scheduled start. |
 | `AUTH_TOKEN` | _(empty)_ | Shared secret for `/ws`; empty keeps the relay open. |
 
@@ -106,7 +106,7 @@ on it forever. A member that stops answering is dropped by a liveness sweep
 for a stale generation is ignored.
 
 **Rooms.** When the host disconnects the room waits `ROOM_TTL` for it to come back;
-if it does not, the jam ends and the guests are told `host left`. A host that
+if it does not, the room ends and the guests are told `host left`. A host that
 reconnects after falling silent is allowed to reclaim the room, evicting the stale
 connection instead of being demoted to guest. Rooms are ephemeral: a relay restart
 drops them and clients recreate the room on reconnect. A pending join is flushed
