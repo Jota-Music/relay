@@ -218,13 +218,15 @@ func (h *hub) sendMembers(r *room) {
 	h.sendAll(targets, msg)
 }
 
-// roomStatus is the public snapshot of a room: counts and flags only, never the
-// queue or the playback state.
+// roomStatus is the public snapshot of a room: counts, flags, and the cached
+// playback (never the queue). A caller must already know the code, which is the
+// room's shared secret.
 type roomStatus struct {
-	Active  bool `json:"active"`
-	Members int  `json:"members"`
-	HasHost bool `json:"hasHost"`
-	Locked  bool `json:"locked"`
+	Active  bool            `json:"active"`
+	Members int             `json:"members"`
+	HasHost bool            `json:"hasHost"`
+	Locked  bool            `json:"locked"`
+	State   json.RawMessage `json:"state,omitempty"`
 }
 
 // status reports the live state of a room by exact code. An unknown code returns
@@ -243,5 +245,6 @@ func (h *hub) status(code string) roomStatus {
 		Members: members,
 		HasHost: r.host != nil,
 		Locked:  r.passHash != "",
+		State:   r.state,
 	}
 }

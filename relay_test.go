@@ -963,6 +963,39 @@ func TestRoomStatus(t *testing.T) {
 	}
 }
 
+func TestRoomStatusState(t *testing.T) {
+	_, srv := newTestHub(t, 8, time.Minute)
+
+	host := dial(t, srv.URL, "party", roleHost)
+	defer host.Close(websocket.StatusNormalClosure, "")
+	read(t, host)
+
+	if st := getStatus(t, srv.URL, "party", ""); len(st.State) != 0 {
+		t.Fatalf("fresh room state = %s", st.State)
+	}
+
+	send(t, host, `{"t":"state","songId":"track-1","playing":true,"positionMs":0}`)
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		st := getStatus(t, srv.URL, "party", "")
+		if len(st.State) != 0 {
+			var got map[string]any
+			if err := json.Unmarshal(st.State, &got); err != nil {
+				t.Fatalf("state decode: %v", err)
+			}
+			if got["songId"] != "track-1" || got["at"].(float64) == 0 {
+				t.Fatalf("state = %v", got)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("state never cached")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestRoomStatusLocked(t *testing.T) {
 	_, srv := newTestHub(t, 8, time.Minute)
 
