@@ -13,7 +13,7 @@ reconnects catch up instantly.
 ## Run
 
 ```sh
-go build ./... && ./relay
+go build ./cmd/relay && ./relay
 # or
 docker run -e PORT=8080 -p 8080:8080 ghcr.io/jota-music/relay
 ```
