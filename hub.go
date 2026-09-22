@@ -98,10 +98,10 @@ func (h *hub) join(code, role, pass string, c *client) (*room, string, error) {
 // joiner waiting on an answer that will never come.
 func (h *hub) leave(c *client) *room {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 
 	r := c.room
 	if r == nil {
-		h.mu.Unlock()
 		return nil
 	}
 	if c.role == roleHost {
@@ -113,19 +113,13 @@ func (h *hub) leave(c *client) *room {
 	}
 	c.room = nil
 
-	var play []byte
-	var out []outbound
 	if r.pending != nil {
 		delete(r.pending.expected, c)
 		delete(r.pending.answers, c)
-		play, out = h.finishRoundLocked(r)
+		h.releaseLocked(r)
 	}
 	if c.role == roleHost && r.host == nil {
-		out = append(out, h.flushJoinsLocked(r)...)
-	}
-	var targets []*client
-	if play != nil {
-		targets = r.all()
+		h.flushJoinsLocked(r)
 	}
 
 	// An empty room is kept until the TTL expires instead of being dropped at
@@ -133,25 +127,7 @@ func (h *hub) leave(c *client) *room {
 	if r.host == nil && r.timer == nil {
 		r.timer = time.AfterFunc(h.ttl, func() { h.endRoom(r) })
 	}
-	h.mu.Unlock()
-
-	if play != nil {
-		h.sendAll(targets, play)
-	}
-	h.sendOut(out)
 	return r
-}
-
-func (h *hub) sendAll(targets []*client, msg []byte) {
-	for _, t := range targets {
-		t.send(msg)
-	}
-}
-
-func (h *hub) sendOut(out []outbound) {
-	for _, o := range out {
-		o.c.send(o.msg)
-	}
 }
 
 // endRoom closes the room and tells the guests the host never came back.
@@ -179,7 +155,10 @@ func (h *hub) endRoom(r *room) {
 	msg, _ := json.Marshal(map[string]any{"t": "error", "reason": "host left"})
 	for _, g := range orphans {
 		g.send(msg)
-		g.closeAfterFlush(500 * time.Millisecond)
+		// ponytail: fixed drain window, the error frame can be lost if the writer
+		// is already exiting; retry the notice if it must be guaranteed
+		time.Sleep(50 * time.Millisecond)
+		g.close()
 	}
 }
 
@@ -215,7 +194,9 @@ func (h *hub) sendMembers(r *room) {
 	h.mu.Unlock()
 
 	msg, _ := json.Marshal(map[string]any{"t": "members", "count": count, "epoch": epoch})
-	h.sendAll(targets, msg)
+	for _, t := range targets {
+		t.send(msg)
+	}
 }
 
 // roomStatus is the public snapshot of a room: counts, flags, and the cached

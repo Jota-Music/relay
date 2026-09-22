@@ -41,13 +41,27 @@ func (h *hub) startRound(r *room, gen string, next []byte) bool {
 	return true
 }
 
+// releaseLocked finishes the pending round when it is complete, delivering the
+// play frame to every member and any joiner that waited on it. send never
+// blocks, so it is safe to run under h.mu.
+func (h *hub) releaseLocked(r *room) {
+	play := h.finishRoundLocked(r)
+	if play == nil {
+		return
+	}
+	for _, t := range r.all() {
+		t.send(play)
+	}
+	h.flushJoinsLocked(r)
+}
+
 // expireRound force-releases a round that ran past its deadline. Members that
 // never answered ready are simply left out, so the room keeps playing instead of
 // waiting on a straggler that is alive but not cooperating.
 func (h *hub) expireRound(r *room, gen string) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.rooms[r.code] != r || r.pending == nil || r.pending.gen != gen {
-		h.mu.Unlock()
 		return
 	}
 	// Count the members that never answered as failures so the round releases.
@@ -56,30 +70,20 @@ func (h *hub) expireRound(r *room, gen string) {
 			r.pending.answers[c] = false
 		}
 	}
-	msg, out := h.finishRoundLocked(r)
-	var targets []*client
-	if msg != nil {
-		targets = r.all()
-	}
-	h.mu.Unlock()
-
-	if msg != nil {
-		h.sendAll(targets, msg)
-	}
-	h.sendOut(out)
+	h.releaseLocked(r)
 }
 
 // finishRoundLocked releases the pending round once everyone expected has
 // answered, promoting its next state to the room snapshot so a late joiner lands
-// on the new track, and returns the `play` frame plus any deferred join replies.
-// The caller holds h.mu, and must send the frames after unlocking.
-func (h *hub) finishRoundLocked(r *room) ([]byte, []outbound) {
+// on the new track, and returns the `play` frame. The caller holds h.mu; play is
+// nil when the round is not ready to release.
+func (h *hub) finishRoundLocked(r *room) []byte {
 	p := r.pending
 	if p == nil {
-		return nil, nil
+		return nil
 	}
 	if len(p.expected) != 0 && len(p.answers) < len(p.expected) {
-		return nil, nil
+		return nil
 	}
 	if p.timer != nil {
 		p.timer.Stop()
@@ -108,29 +112,17 @@ func (h *hub) finishRoundLocked(r *room) ([]byte, []outbound) {
 		"at":         at,
 		"positionMs": 0,
 	})
-	// A joiner held back by this round waits for its release: hand it the track
-	// the room is actually starting on, not the outgoing one.
-	return msg, h.flushJoinsLocked(r)
+	return msg
 }
 
 // markReady records c's answer for the round and releases it once every expected
 // member has answered (ok=false members count as answered, so they never stall).
 func (h *hub) markReady(c *client, r *room, gen string, ok bool) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.rooms[r.code] != r || r.pending == nil || gen != r.pending.gen || !r.pending.expected[c] {
-		h.mu.Unlock()
 		return
 	}
 	r.pending.answers[c] = ok
-	msg, out := h.finishRoundLocked(r)
-	var targets []*client
-	if msg != nil {
-		targets = r.all()
-	}
-	h.mu.Unlock()
-
-	if msg != nil {
-		h.sendAll(targets, msg)
-	}
-	h.sendOut(out)
+	h.releaseLocked(r)
 }

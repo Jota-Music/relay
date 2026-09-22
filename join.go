@@ -97,22 +97,19 @@ func (h *hub) expireJoin(r *room, id string) {
 }
 
 // flushJoinsLocked answers every waiting joiner from the current snapshot and
-// clears them. The caller holds h.mu and sends the returned frames after
-// unlocking.
-func (h *hub) flushJoinsLocked(r *room) []outbound {
+// clears them. send never blocks, so it is safe to deliver under h.mu.
+func (h *hub) flushJoinsLocked(r *room) {
 	if len(r.joins) == 0 {
-		return nil
+		return
 	}
 	now := time.Now().UnixMilli()
-	out := make([]outbound, 0, len(r.joins))
 	for id, pj := range r.joins {
 		if pj.timer != nil {
 			pj.timer.Stop()
 		}
-		out = append(out, outbound{pj.c, buildSnapshot(pj.t1, now, r.queue, r.state)})
+		pj.c.send(buildSnapshot(pj.t1, now, r.queue, r.state))
 		delete(r.joins, id)
 	}
-	return out
 }
 
 // remember updates the room snapshot and returns the frame to forward. The relay

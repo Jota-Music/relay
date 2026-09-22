@@ -30,7 +30,6 @@ type client struct {
 	done     chan struct{}
 	once     sync.Once
 	lastSeen atomic.Int64
-	inFlight atomic.Int64
 }
 
 func newClient(conn *websocket.Conn) *client {
@@ -75,16 +74,8 @@ func (c *client) closed() bool {
 func (c *client) send(data []byte) {
 	select {
 	case <-c.done:
-		return
-	default:
-	}
-	c.inFlight.Add(1)
-	select {
 	case c.out <- data:
-	case <-c.done:
-		c.inFlight.Add(-1)
 	default:
-		c.inFlight.Add(-1)
 		c.close()
 	}
 }
@@ -98,7 +89,6 @@ func (c *client) writeLoop() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			err := c.conn.Write(ctx, websocket.MessageText, msg)
 			cancel()
-			c.inFlight.Add(-1)
 			if err != nil {
 				c.close()
 				return
@@ -112,16 +102,6 @@ func (c *client) close() {
 		close(c.done)
 		_ = c.conn.Close(websocket.StatusNormalClosure, "")
 	})
-}
-
-// closeAfterFlush waits until every enqueued frame has been written before
-// closing, so a final notice (like "host left") is not lost to the close.
-func (c *client) closeAfterFlush(timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
-	for c.inFlight.Load() > 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	c.close()
 }
 
 func (h *hub) readLoop(c *client, r *room) {

@@ -52,13 +52,6 @@ type pendingJoin struct {
 	timer     *time.Timer
 }
 
-// outbound is a frame addressed to a single client, sent after the hub lock is
-// released.
-type outbound struct {
-	c   *client
-	msg []byte
-}
-
 type room struct {
 	code     string
 	host     *client
